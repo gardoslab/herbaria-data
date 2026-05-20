@@ -77,6 +77,9 @@ def main():
 
         # Load processed and failed IDs
         write("Loading processed and failed IDs...")
+        write(f"  Status directory: {status_dir}")
+        write(f"  {CHECKPOINT_BASENAME}: {checkpoint_file}")
+        write(f"  {FAILED_BASENAME}: {failed_file}")
         processed_ids = load_id_set(checkpoint_file)
         failed_ids = load_id_set(failed_file)
 
@@ -201,7 +204,7 @@ def main():
             write()
 
         write("=" * 70)
-        write(f"Output written to: {output_file}")
+        write(f"Summary written to: {os.path.abspath(output_file)}")
         write("=" * 70)
 
 if __name__ == "__main__":
