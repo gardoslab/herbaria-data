@@ -11,19 +11,20 @@ This script answers:
 5. How many gbifIDs are remaining?
 6. Distribution of images per gbifID (to understand multi-image records)
 
-Output is written to summary.txt (by default in the current working directory).
+Output is written to summary_YYYYMMDDHHMM.txt (by default in the current working directory).
 """
 
 import argparse
 import pandas as pd
 import os
 from collections import Counter
+from datetime import datetime
 
 # File paths (matching image_install_parallel.py)
 GBIF_MULTIMEDIA_DATA = "/projectnb/herbdl/data/GBIF-F25/multimedia.txt"
 CHECKPOINT_BASENAME = "processed_ids.txt"
 FAILED_BASENAME = "failed_ids.txt"
-OUTPUT_BASENAME = "summary.txt"
+OUTPUT_BASENAME_PREFIX = "summary"
 
 STATUS_BASE_DIR = os.getcwd()
 OUTPUT_BASE_DIR = os.getcwd()
@@ -42,7 +43,7 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         default=OUTPUT_BASE_DIR,
-        help="Directory for summary.txt "
+        help="Directory for summary_YYYYMMDDHHMM.txt "
         f"(default: {OUTPUT_BASE_DIR!r})",
     )
     return parser.parse_args()
@@ -55,12 +56,18 @@ def load_id_set(filepath):
     return set()
 
 def main():
+    run_time = datetime.now()
+    run_timestamp = run_time.strftime("%Y%m%d%H%M")
+    run_date_display = run_time.strftime("%Y-%m-%d %H:%M:%S")
+
     args = parse_args()
     status_dir = os.path.abspath(args.status_dir)
     output_dir = os.path.abspath(args.output_dir)
     checkpoint_file = os.path.join(status_dir, CHECKPOINT_BASENAME)
     failed_file = os.path.join(status_dir, FAILED_BASENAME)
-    output_file = os.path.join(output_dir, OUTPUT_BASENAME)
+    output_file = os.path.join(
+        output_dir, f"{OUTPUT_BASENAME_PREFIX}_{run_timestamp}.txt"
+    )
     os.makedirs(output_dir, exist_ok=True)
 
     # Open output file
@@ -70,6 +77,8 @@ def main():
             out.write(msg + "\n")
             print(msg)
 
+        write(f"Run date: {run_date_display}")
+        write()
         write("=" * 70)
         write("Image Installation Progress Analysis")
         write("=" * 70)
