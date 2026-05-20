@@ -11,18 +11,41 @@ This script answers:
 5. How many gbifIDs are remaining?
 6. Distribution of images per gbifID (to understand multi-image records)
 
-Output is written to summary.txt in the same directory.
+Output is written to summary.txt (by default in the current working directory).
 """
 
+import argparse
 import pandas as pd
 import os
 from collections import Counter
 
 # File paths (matching image_install_parallel.py)
 GBIF_MULTIMEDIA_DATA = "/projectnb/herbdl/data/GBIF-F25/multimedia.txt"
-CHECKPOINT_FILE = "processed_ids.txt"
-FAILED_FILE = "failed_ids.txt"
-OUTPUT_FILE = "summary.txt"
+CHECKPOINT_BASENAME = "processed_ids.txt"
+FAILED_BASENAME = "failed_ids.txt"
+OUTPUT_BASENAME = "summary.txt"
+
+STATUS_BASE_DIR = os.getcwd()
+OUTPUT_BASE_DIR = os.getcwd()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Analyze image installation progress from checkpoint files."
+    )
+    parser.add_argument(
+        "--status-dir",
+        default=STATUS_BASE_DIR,
+        help="Directory containing processed_ids.txt and failed_ids.txt "
+        f"(default: {STATUS_BASE_DIR!r})",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=OUTPUT_BASE_DIR,
+        help="Directory for summary.txt "
+        f"(default: {OUTPUT_BASE_DIR!r})",
+    )
+    return parser.parse_args()
 
 def load_id_set(filepath):
     """Load IDs from a text file into a set."""
@@ -32,8 +55,16 @@ def load_id_set(filepath):
     return set()
 
 def main():
+    args = parse_args()
+    status_dir = os.path.abspath(args.status_dir)
+    output_dir = os.path.abspath(args.output_dir)
+    checkpoint_file = os.path.join(status_dir, CHECKPOINT_BASENAME)
+    failed_file = os.path.join(status_dir, FAILED_BASENAME)
+    output_file = os.path.join(output_dir, OUTPUT_BASENAME)
+    os.makedirs(output_dir, exist_ok=True)
+
     # Open output file
-    with open(OUTPUT_FILE, 'w') as out:
+    with open(output_file, 'w') as out:
         def write(msg=""):
             """Write to both file and console."""
             out.write(msg + "\n")
@@ -46,8 +77,8 @@ def main():
 
         # Load processed and failed IDs
         write("Loading processed and failed IDs...")
-        processed_ids = load_id_set(CHECKPOINT_FILE)
-        failed_ids = load_id_set(FAILED_FILE)
+        processed_ids = load_id_set(checkpoint_file)
+        failed_ids = load_id_set(failed_file)
 
         write(f"  Processed IDs loaded: {len(processed_ids):,}")
         write(f"  Failed IDs loaded: {len(failed_ids):,}")
@@ -170,7 +201,7 @@ def main():
             write()
 
         write("=" * 70)
-        write(f"Output written to: {OUTPUT_FILE}")
+        write(f"Output written to: {output_file}")
         write("=" * 70)
 
 if __name__ == "__main__":
