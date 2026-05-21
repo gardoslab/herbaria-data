@@ -56,6 +56,18 @@ INSERT_BATCH = 200_000
 LEGACY_BATCH = 50_000
 
 
+def progress(msg):
+    """
+    Print a progress line, flushed immediately so a batch job's .o log updates
+    live instead of only at exit. Overwrites in place on an interactive
+    terminal; writes one line per update when redirected to a log file.
+    """
+    if sys.stdout.isatty():
+        print(f"\r{msg}", end="", flush=True)
+    else:
+        print(msg, flush=True)
+
+
 def hierarchical_path(base_dir, gbif_id, suffix=""):
     """Mirror image_install_db.get_hierarchical_path (without makedirs)."""
     stem = str(gbif_id)
@@ -125,7 +137,7 @@ def ingest_multimedia(conn, multimedia_path):
         )
         conn.commit()
         inserted += len(rows)
-        print(f"    {inserted:,}/{len(df):,} image rows", end="\r")
+        progress(f"    {inserted:,}/{len(df):,} image rows")
     print(f"    {inserted:,} image rows inserted        ")
 
     print("  Inserting gbifID rows ...")
@@ -208,8 +220,8 @@ def import_legacy(conn, processed_file, install_path):
             if len(updates) >= LEGACY_BATCH:
                 flush(updates)
                 updates = []
-                print(f"    renamed={renamed:,} relabeled={relabeled:,} "
-                      f"missing={missing:,}", end="\r")
+                progress(f"    renamed={renamed:,} relabeled={relabeled:,} "
+                         f"missing={missing:,}")
     flush(updates)
     print(f"    renamed={renamed:,}  already-suffixed={relabeled:,}  "
           f"file-missing={missing:,}")
@@ -270,6 +282,10 @@ def connect(db_path, bulk_load):
 
 
 def main():
+    # Line-buffer stdout so progress appears in a batch job's .o log live,
+    # not only when the job finishes.
+    sys.stdout.reconfigure(line_buffering=True)
+
     args = parse_args()
     start = time.time()
 

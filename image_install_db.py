@@ -23,6 +23,7 @@ Accurate as of May 2026.
 """
 
 import os
+import sys
 import time
 import random
 import logging
@@ -90,6 +91,18 @@ session.mount("http://", adapter)
 session.mount("https://", adapter)
 
 logger = logging.getLogger(__name__)
+
+
+def progress(msg):
+    """
+    Print a progress line, flushed immediately so a batch job's .o log updates
+    live instead of only at exit. Overwrites in place on an interactive
+    terminal; writes one line per update when redirected to a log file.
+    """
+    if sys.stdout.isatty():
+        print(f"\r{msg}", end="", flush=True)
+    else:
+        print(msg, flush=True)
 
 
 # ---- paths -------------------------------------------------------------------
@@ -462,6 +475,10 @@ def process_id(db, gbif_id, total_to_install):
 # ---- main --------------------------------------------------------------------
 
 def main():
+    # Line-buffer stdout so progress appears in a batch job's .o log live,
+    # not only when the job finishes.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("-c", "--country", dest="country",
                         help="(Unsupported) country filter -- multimedia.txt "
@@ -522,8 +539,9 @@ def main():
                 # Persist circuit-breaker state periodically so a killed job
                 # (e.g. qsub h_rt limit) does not lose it.
                 db.save_host_state(host_error_counts, host_block_until)
-                print(f"  processed {min(start + WORK_CHUNK, total_to_install)}"
-                      f"/{total_to_install} gbifIDs", end="\r")
+                progress(f"  processed "
+                         f"{min(start + WORK_CHUNK, total_to_install)}"
+                         f"/{total_to_install} gbifIDs")
     except KeyboardInterrupt:
         logger.warning("Interrupted by user; saving state and exiting.")
     finally:
