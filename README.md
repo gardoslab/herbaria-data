@@ -1,4 +1,4 @@
-# Utils Directory
+# GBIF Image Data Download
 
 This directory contains utility scripts for managing herbarium specimen images, including downloading, processing, organizing, and labeling datasets.
 
