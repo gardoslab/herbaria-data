@@ -14,7 +14,9 @@ conda activate spring-2026-pyt
 
 # --processed-file points at the production processed_ids.txt, which lives in
 # ljhao's working directory, not this repo.
-python init_download_db.py \
+# --legacy-only means only process the legacy images without creating the database.
+#    Run this on subsequent times after db was created.
+python init_download_db.py --legacy-only \
     --processed-file /projectnb/herbdl/workspaces/ljhao/herbdl/utils/processed_ids.txt
 
 ### The command below is used to submit the job to the cluster

@@ -104,6 +104,7 @@ qsub -N image_install -l h_rt=48:00:00 -pe omp 16 -P herbdl -m beas -M your_emai
 ```bash
 python init_download_db.py                 # build DB + import legacy progress
 python init_download_db.py --skip-legacy   # build DB only
+python init_download_db.py --legacy-only   # (re-)run only the legacy import
 python init_download_db.py --reset         # rebuild from scratch
 ```
 

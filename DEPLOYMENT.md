@@ -75,6 +75,7 @@ python init_download_db.py \
 |---|---|
 | `python init_download_db.py` | Build DB + import legacy progress |
 | `python init_download_db.py --skip-legacy` | Build DB only (everything starts `pending`) |
+| `python init_download_db.py --legacy-only` | Skip the ingest; only (re-)run the legacy import on an existing DB |
 | `python init_download_db.py --reset` | Delete an existing DB and rebuild from scratch |
 
 **Expected output** — a status breakdown, e.g.:
@@ -90,8 +91,11 @@ Final gbifID status counts:
 - `partial` — has an image already (legacy first image) but more to fetch
 - `pending` — never attempted
 
-Re-running the builder is safe: file renames are idempotent (already-renamed
-files are detected and reused). If a build fails partway, re-run with `--reset`.
+Re-running is safe: file renames and database updates are idempotent
+(already-renamed files are detected and reused). If the **ingest** fails partway,
+re-run with `--reset`. If only the **legacy import** fails partway (e.g. it was
+interrupted), re-run with `--legacy-only` — that finishes the import without
+redoing the hour-long ingest.
 
 ---
 
@@ -206,7 +210,8 @@ must be re-run.
 | Symptom | Fix |
 |---|---|
 | `Status database not found` | Run Phase 1 first (`init_download_db.sh`). |
-| `Database already exists` from the builder | Intended guard — pass `--reset` to rebuild. |
-| `database is locked` | Another process is using the DB; ensure only one downloader job runs. The code already sets a 120 s busy timeout. |
+| `Database already exists` from the builder | Intended guard — `--reset` to rebuild, or `--legacy-only` to just (re-)run the legacy import. |
+| `database is locked` | The builder now uses WAL mode (readers do not block the writer) and a 120 s busy timeout, so this should not recur. If the legacy import was interrupted by it, finish it with `init_download_db.py --legacy-only`. Still avoid running two writers against one DB. |
+| Legacy import interrupted partway | Re-run `init_download_db.py --legacy-only` — it is idempotent and skips the hour-long ingest. |
 | Builder runs out of memory | `multimedia.txt` is large; request more memory (e.g. a larger `-pe omp` slot count). |
 | Legacy progress not imported | `--processed-file` was not pointed at ljhao's `processed_ids.txt`. |

@@ -27,10 +27,14 @@ This script is destructive-ish (it renames files and can drop an existing DB
 with --reset). It does not download anything. Run it once before the first
 run of image_install_db.py.
 
+The legacy import is idempotent and resumable: if it is interrupted, re-run
+with --legacy-only to finish it without redoing the multimedia ingest.
+
 Usage
 -----
     python init_download_db.py                 # build DB + import legacy
     python init_download_db.py --skip-legacy   # build DB only
+    python init_download_db.py --legacy-only   # (re-)run only the legacy import
     python init_download_db.py --reset         # rebuild from scratch
 """
 
@@ -73,6 +77,9 @@ def parse_args():
                    help="processed_ids.txt to import as already-done gbifIDs")
     p.add_argument("--skip-legacy", action="store_true",
                    help="Do not import processed_ids.txt")
+    p.add_argument("--legacy-only", action="store_true",
+                   help="Skip the ingest; only (re-)run the legacy import on an "
+                        "existing database (use this to finish an interrupted import)")
     p.add_argument("--reset", action="store_true",
                    help="Delete an existing database before building")
     return p.parse_args()
@@ -144,15 +151,28 @@ def import_legacy(conn, processed_file, install_path):
     updates = []
 
     def flush(batch):
-        if batch:
-            conn.executemany(
-                "UPDATE images SET status='success', "
-                "  error_type=?, file_path=?, file_size=?, "
-                "  last_attempt_at=datetime('now') "
-                "WHERE gbif_id=? AND img_index=0",
-                batch,
-            )
-            conn.commit()
+        if not batch:
+            return
+        # WAL mode + the 120 s busy timeout make a lock here very unlikely, but
+        # retry rather than throw away a long-running import if one occurs.
+        for attempt in range(1, 4):
+            try:
+                conn.executemany(
+                    "UPDATE images SET status='success', "
+                    "  error_type=?, file_path=?, file_size=?, "
+                    "  last_attempt_at=datetime('now') "
+                    "WHERE gbif_id=? AND img_index=0",
+                    batch,
+                )
+                conn.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < 3:
+                    print(f"\n  database locked; retry {attempt}/3 "
+                          f"in {10 * attempt}s ...")
+                    time.sleep(10 * attempt)
+                    continue
+                raise
 
     with open(processed_file) as fh:
         for line in fh:
@@ -218,9 +238,54 @@ def import_legacy(conn, processed_file, install_path):
     conn.commit()
 
 
+def report_status(conn):
+    """Print the gbifID status breakdown."""
+    print("\nFinal gbifID status counts:")
+    for status, count in conn.execute(
+        "SELECT status, COUNT(*) FROM gbif_ids GROUP BY status ORDER BY status"
+    ):
+        print(f"  {status:10s} {count:,}")
+
+
+def connect(db_path, bulk_load):
+    """
+    Open the database with a 120 s busy timeout, so a momentary lock from a
+    concurrent reader (e.g. status_report.py) makes the write wait rather than
+    abort the run.
+
+    bulk_load=True  -> fastest, no durability (for the rebuildable ingest).
+    bulk_load=False -> WAL + synchronous=NORMAL: durable, and readers never
+                       block the writer (used for the legacy import).
+    """
+    conn = sqlite3.connect(db_path, timeout=120)
+    conn.execute("PRAGMA busy_timeout=120000")
+    conn.execute("PRAGMA cache_size=-200000")  # ~200 MB page cache
+    if bulk_load:
+        conn.execute("PRAGMA journal_mode=OFF")
+        conn.execute("PRAGMA synchronous=OFF")
+    else:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
 def main():
     args = parse_args()
     start = time.time()
+
+    # --legacy-only: skip the ingest and just (re-)run the legacy import. Use
+    # this to finish an interrupted import without rebuilding the database.
+    if args.legacy_only:
+        if not os.path.exists(args.db):
+            sys.exit(f"--legacy-only needs an existing database, but none was "
+                     f"found at: {args.db}\nRun the full build first.")
+        print(f"--legacy-only: (re-)running the legacy import on {args.db}")
+        conn = connect(args.db, bulk_load=False)
+        import_legacy(conn, args.processed_file, args.install_path)
+        report_status(conn)
+        conn.close()
+        print(f"\nDone in {time.time() - start:.0f}s.")
+        return
 
     if os.path.exists(args.db):
         if args.reset:
@@ -232,15 +297,13 @@ def main():
                     pass
         else:
             sys.exit(f"Database already exists: {args.db}\n"
-                     f"Pass --reset to rebuild it from scratch.")
+                     f"  --reset        rebuild it from scratch\n"
+                     f"  --legacy-only  (re-)run just the legacy import on it")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
-    conn = sqlite3.connect(args.db)
     # Fast bulk-load settings; the DB is fully rebuildable, so durability during
-    # ingest is not needed. image_install_db.py switches it to WAL later.
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    conn.execute("PRAGMA cache_size=-200000")  # ~200 MB page cache
+    # the ingest is not needed.
+    conn = connect(args.db, bulk_load=True)
 
     print("Creating schema ...")
     ddb.create_tables(conn)
@@ -251,14 +314,13 @@ def main():
     ddb.create_indexes(conn)
 
     if not args.skip_legacy:
+        # Switch to a durable, reader-tolerant mode for the legacy import: it
+        # renames files on disk, so a crash here is costlier than during ingest.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         import_legacy(conn, args.processed_file, args.install_path)
 
-    print("\nFinal gbifID status counts:")
-    for status, count in conn.execute(
-        "SELECT status, COUNT(*) FROM gbif_ids GROUP BY status ORDER BY status"
-    ):
-        print(f"  {status:10s} {count:,}")
-
+    report_status(conn)
     conn.close()
     print(f"\nDone in {time.time() - start:.0f}s. Database: {os.path.abspath(args.db)}")
 
