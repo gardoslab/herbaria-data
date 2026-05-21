@@ -3,3 +3,7 @@ __pycache__/
 
 # ignore generated summary files
 summary*.txt
+
+# ignore batch scheduler log files
+*.e[0-9]*
+*.o[0-9]*
