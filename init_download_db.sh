@@ -19,5 +19,8 @@ conda activate spring-2026-pyt
 python init_download_db.py --legacy-only \
     --processed-file /projectnb/herbdl/workspaces/ljhao/herbdl/utils/processed_ids.txt
 
+# The other big initial run is tracked in
+# /projectnb/herbdl/workspaces/tsehou26/herbarium_project/utils/processed_ids.txt and .../failed_ids.txt
+
 ### The command below is used to submit the job to the cluster
 ### qsub -N init_download_db -l h_rt=12:00:00 -pe omp 16 -P herbdl -m beas -M your_email@bu.edu init_download_db.sh
