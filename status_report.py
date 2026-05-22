@@ -6,18 +6,25 @@ This replaces analyze_image_progress.py: instead of loading ~180 MB of text
 checkpoint files and re-grouping the 59M-row multimedia.txt with pandas, every
 number here is a single indexed SQL query, so the report returns in seconds.
 
+Counts are over *distinct images* (a IIIF manifest plus its resolution variants
+count once -- see download_db.canonical_image_key).
+
 The same numbers are available ad hoc -- a few useful queries:
 
     -- how many of each kind of failure?
     SELECT error_type, COUNT(*) FROM images
     WHERE status LIKE 'failed%' GROUP BY error_type ORDER BY 2 DESC;
 
-    -- every URL still worth retrying
-    SELECT gbif_id, url FROM images WHERE status='failed_transient';
+    -- every image still worth retrying
+    SELECT gbif_id, image_no, urls FROM images WHERE status='failed_transient';
 
-    -- worst hosts
-    SELECT host, COUNT(*) FROM images WHERE status LIKE 'failed%'
-    GROUP BY host ORDER BY 2 DESC LIMIT 20;
+    -- URLs that returned an HTML/text page, with the captured message
+    SELECT host, error_detail FROM images
+    WHERE error_type='invalid_content_type' GROUP BY host;
+
+    -- raw files (DNG etc.) kept for a later conversion pass
+    SELECT gbif_id, image_no, file_path FROM images
+    WHERE error_type='raw_unprocessed';
 
 Usage:
     python status_report.py [--db PATH] [--output-dir DIR]
@@ -80,16 +87,21 @@ def main():
         write(f"Still in the work queue:        {remaining:,}")
 
         # -- per-image progress ----------------------------------------------
-        section("IMAGE (URL) PROGRESS")
+        section("DISTINCT-IMAGE PROGRESS")
         img_counts = dict(conn.execute(
             "SELECT status, COUNT(*) FROM images GROUP BY status").fetchall())
         total_imgs = sum(img_counts.values())
-        write(f"Total image URLs:               {total_imgs:,}")
+        write(f"Total distinct images:          {total_imgs:,}")
         for status in (ddb.ST_SUCCESS, ddb.ST_PENDING,
                        ddb.ST_FAILED_TRANSIENT, ddb.ST_FAILED_PERMANENT):
             count = img_counts.get(status, 0)
             pct = (count / total_imgs * 100) if total_imgs else 0.0
             write(f"  {status:18s}          {count:>14,}  ({pct:5.2f}%)")
+        raw_kept = conn.execute(
+            "SELECT COUNT(*) FROM images WHERE error_type=?",
+            (ddb.ERR_RAW_UNPROCESSED,)).fetchone()[0]
+        write(f"  (of 'success', kept raw -- DNG etc., need conversion: "
+              f"{raw_kept:,})")
 
         # -- failure breakdown ------------------------------------------------
         section("FAILURES BY TYPE")
@@ -117,6 +129,23 @@ def main():
         if not rows:
             write("(none)")
 
+        # -- non-image (HTML/text) responses ---------------------------------
+        section("NON-IMAGE RESPONSES BY HOST (for follow-up)")
+        write("Hosts whose URLs returned an HTML/text page instead of an image")
+        write("(e.g. 'direct download no longer supported'). Sample message shown.")
+        write("-" * 70)
+        rows = conn.execute(
+            "SELECT host, COUNT(*) AS n, MIN(error_detail) "
+            "FROM images WHERE error_type=? "
+            "GROUP BY host ORDER BY n DESC LIMIT 20",
+            (ddb.ERR_INVALID_CONTENT,)).fetchall()
+        for host, count, sample in rows:
+            write(f"{(host or '?')[:45]:45s} {count:>10,}")
+            if sample:
+                write(f"    {sample[:200].strip()}")
+        if not rows:
+            write("(none recorded yet)")
+
         # -- worst hosts ------------------------------------------------------
         section("TOP 20 HOSTS BY FAILED IMAGES")
         write(f"{'host':40s} {'failed':>10s} {'success':>10s}")
@@ -142,11 +171,15 @@ def main():
         write(f"Hosts currently in cooldown:                          {blocked:,}")
 
         section("NOTES")
-        write("- 'done'    = every image URL for the gbifID succeeded.")
+        write("- Counts are over distinct images: a IIIF manifest plus its")
+        write("  resolution variants count as one image.")
+        write("- 'done'    = every distinct image for the gbifID succeeded.")
         write("- 'partial' = still has retryable work; stays in the queue.")
         write("- 'failed'  = all images terminal, not all succeeded; no retries left.")
         write("- failed_transient images are retried until "
               f"{ddb.MAX_ATTEMPTS} attempts, then count toward 'failed'.")
+        write("- 'raw_unprocessed' images ARE downloaded (status success); they")
+        write("  are raw files (DNG etc.) awaiting a separate conversion pass.")
         write()
         write(f"Summary written to: {os.path.abspath(output_file)}")
 

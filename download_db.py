@@ -2,25 +2,29 @@
 SQLite-backed download-status tracking for image_install_db.py.
 
 Replaces the flat processed_ids.txt / failed_ids.txt checkpoint files with a
-queryable database that records, for every image URL, whether it succeeded or
-failed and *why*. That makes it possible to:
-  * resume a run without re-reading and re-grouping the 59M-row multimedia.txt,
-  * retry only transient failures (timeouts, rate limits, 5xx, dropped
-    connections) while leaving permanent ones (404/410/etc.) alone,
-  * answer questions like "how many 404s?" or "which hosts fail most?" with a
-    single SQL query (see status_report.py).
+queryable database that records, for every *distinct image*, whether it was
+downloaded and -- when it failed -- why.
+
+Distinct images vs. multimedia rows
+-----------------------------------
+A gbifID often has several rows in GBIF's multimedia.txt that all point at the
+SAME photo: a IIIF manifest plus the 300px / 1600px renderings of one specimen.
+canonical_image_key() collapses those to a single key, so one row in the
+`images` table = one distinct image = one downloaded file. Non-IIIF URLs key to
+themselves (metadata cannot tell whether two opaque URLs are the same photo --
+that needs content hashing, which this layer does not do).
 
 Tables
 ------
-images    one row per source image URL (a GBIF "identifier").
-gbif_ids  one row per gbifID; doubles as the resumable work queue.
-hosts     per-host error tally + cooldown timestamp, so circuit-breaker and
-          rate-limit state survive a job restart.
+images    one row per distinct image; the download/work unit.
+gbif_ids  one row per gbifID; the resumable work queue.
+hosts     per-host error tally + cooldown, surviving a restart.
 
-A gbifID is 'done' only when every one of its images has status 'success'.
+A gbifID is 'done' only when every one of its distinct images has succeeded.
 """
 
 import os
+import re
 import time
 import sqlite3
 import threading
@@ -32,28 +36,32 @@ MAX_ATTEMPTS = 4
 
 # ---- images.status -----------------------------------------------------------
 ST_PENDING = "pending"            # never attempted
-ST_SUCCESS = "success"            # downloaded (and resized) OK
+ST_SUCCESS = "success"            # image obtained (resized JPEG, or kept raw)
 ST_FAILED_PERMANENT = "failed_permanent"   # retrying will not help
 ST_FAILED_TRANSIENT = "failed_transient"   # may succeed on a later run
 
 # ---- gbif_ids.status ---------------------------------------------------------
 G_PENDING = "pending"             # no image attempted yet
 G_PARTIAL = "partial"             # some work still possible (in the work queue)
-G_DONE = "done"                   # every image succeeded
+G_DONE = "done"                   # every distinct image succeeded
 G_FAILED = "failed"               # all images terminal, not all succeeded
 
-# ---- error_type values -------------------------------------------------------
+# ---- error_type values (on failure rows) ------------------------------------
 ERR_RATE_LIMITED = "rate_limited"          # HTTP 429
 ERR_TIMEOUT = "timeout"                    # connect/read timeout, HTTP 408
 ERR_SERVER = "server_error"                # HTTP 5xx
 ERR_CONNECTION = "connection_broken"       # dropped connection / IncompleteRead
 ERR_TRUNCATED = "truncated"                # download shorter than Content-Length
 ERR_MANIFEST = "manifest_error"            # IIIF manifest could not be parsed
-ERR_INVALID_CONTENT = "invalid_content_type"   # server returned HTML/XML/text
-ERR_NOT_IMAGE = "not_an_image"             # bytes downloaded but not decodable
-ERR_NO_URL = "no_url"                      # no usable URL for this identifier
+ERR_INVALID_CONTENT = "invalid_content_type"   # URL returned HTML/text, not an image
+ERR_NOT_IMAGE = "not_an_image"             # bytes downloaded but undecodable junk
+ERR_NO_URL = "no_url"                      # no usable URL for this image
 ERR_OTHER = "other"                        # anything uncategorised
-ERR_LEGACY = "legacy_unverified_index"     # marker on imported processed_ids.txt
+
+# ---- flags carried on status='success' rows (not failures) ------------------
+ERR_LEGACY = "legacy_unverified_index"     # imported from processed_ids.txt
+ERR_RAW_UNPROCESSED = "raw_unprocessed"    # kept as a raw file (e.g. DNG); needs
+                                           # a later conversion pass to JPEG
 
 # Everything not in this set is treated as permanent (e.g. any "http_4xx").
 TRANSIENT_ERRORS = {
@@ -83,27 +91,56 @@ def status_for_error(error_type):
     return ST_FAILED_PERMANENT if is_permanent(error_type) else ST_FAILED_TRANSIENT
 
 
+# ---- canonical image identity -----------------------------------------------
+
+_IIIF_MANIFEST = re.compile(r"/manifest(?:\.json)?$", re.IGNORECASE)
+_IIIF_IMAGE_TAIL = re.compile(
+    r"/[^/]+/[^/]+/[-+0-9.!]+/(?:default|color|gray|bitonal)\.[A-Za-z0-9]+$",
+    re.IGNORECASE,
+)
+
+
+def canonical_image_key(url):
+    """
+    Return a canonical identity for the image a URL points at.
+
+    A IIIF Presentation manifest (".../E00699064/manifest") and every IIIF
+    Image-API rendering (".../E00699064/full/1600,/0/default.jpg") of one
+    specimen collapse to the same key -- the IIIF identifier ".../E00699064".
+    Non-IIIF URLs key to themselves.
+    """
+    u = (url or "").strip()
+    stripped = _IIIF_MANIFEST.sub("", u)
+    if stripped != u:
+        return stripped
+    stripped = _IIIF_IMAGE_TAIL.sub("", u)
+    if stripped != u:
+        return stripped
+    return u
+
+
 # ---- schema ------------------------------------------------------------------
 
 _TABLES = [
     """CREATE TABLE IF NOT EXISTS images (
         gbif_id         INTEGER NOT NULL,
-        img_index       INTEGER NOT NULL,   -- position in this ID's URL list
-        url             TEXT    NOT NULL,
+        image_no        INTEGER NOT NULL,   -- distinct-image ordinal in the gbifID
+        image_key       TEXT    NOT NULL,   -- canonical identity (debug/transparency)
+        urls            TEXT    NOT NULL,   -- newline-joined candidate URLs, best first
         host            TEXT,
         status          TEXT    NOT NULL DEFAULT 'pending',
         http_status     INTEGER,
         error_type      TEXT,
-        error_detail    TEXT,               -- truncated message, for debugging
+        error_detail    TEXT,               -- truncated message / captured page text
         file_path       TEXT,
-        file_size       INTEGER,            -- bytes on disk after resize
+        file_size       INTEGER,            -- bytes on disk
         attempts        INTEGER NOT NULL DEFAULT 0,
         last_attempt_at TEXT,
-        PRIMARY KEY (gbif_id, img_index)
+        PRIMARY KEY (gbif_id, image_no)
     )""",
     """CREATE TABLE IF NOT EXISTS gbif_ids (
         gbif_id      INTEGER PRIMARY KEY,
-        n_images     INTEGER NOT NULL DEFAULT 0,
+        n_images     INTEGER NOT NULL DEFAULT 0,   -- distinct images
         n_success    INTEGER NOT NULL DEFAULT 0,
         status       TEXT    NOT NULL DEFAULT 'pending',
         completed_at TEXT
@@ -181,23 +218,23 @@ class DownloadDB:
             return [row[0] for row in cur.fetchall()]
 
     def get_images_for(self, gbif_id):
-        """Return (img_index, url, host, status, attempts) rows for one gbifID."""
+        """Return (image_no, image_key, urls, host, status, attempts) per image."""
         with self.lock:
             cur = self.conn.execute(
-                "SELECT img_index, url, host, status, attempts "
-                "FROM images WHERE gbif_id=? ORDER BY img_index",
+                "SELECT image_no, image_key, urls, host, status, attempts "
+                "FROM images WHERE gbif_id=? ORDER BY image_no",
                 (gbif_id,),
             )
             return cur.fetchall()
 
     # -- recording results -----------------------------------------------------
 
-    def record_image_result(self, gbif_id, img_index, status, *, host=None,
+    def record_image_result(self, gbif_id, image_no, status, *, host=None,
                              http_status=None, error_type=None, error_detail=None,
                              file_path=None, file_size=None,
                              increment_attempts=True):
         """Write the outcome of one image attempt into the images table."""
-        detail = (error_detail or "")[:500] or None
+        detail = (error_detail or "")[:2000] or None
         delta = 1 if increment_attempts else 0
         with self.lock:
             self.conn.execute(
@@ -205,9 +242,9 @@ class DownloadDB:
                 "  status=?, host=COALESCE(?, host), http_status=?, "
                 "  error_type=?, error_detail=?, file_path=?, file_size=?, "
                 "  attempts=attempts+?, last_attempt_at=datetime('now') "
-                "WHERE gbif_id=? AND img_index=?",
+                "WHERE gbif_id=? AND image_no=?",
                 (status, host, http_status, error_type, detail, file_path,
-                 file_size, delta, gbif_id, img_index),
+                 file_size, delta, gbif_id, image_no),
             )
             self.conn.commit()
 

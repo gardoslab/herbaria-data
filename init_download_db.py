@@ -5,27 +5,27 @@ One-time builder for the image-download status database (download_status.db).
 What it does
 ------------
 1. Creates the SQLite schema (see download_db.py).
-2. Reads multimedia.txt once and loads every (gbifID, image URL) pair into the
-   `images` table and every gbifID into `gbif_ids`. After this, runs of
-   image_install_db.py no longer need to re-read and re-group the 59M-row
+2. Reads multimedia.txt once and groups its rows into *distinct images*: a IIIF
+   manifest plus the resolution variants of one specimen collapse to a single
+   image (see download_db.canonical_image_key). Each distinct image becomes one
+   row in `images`, carrying all of its candidate URLs; `gbif_ids` gets one row
+   per gbifID. After this, runs of image_install_db.py never re-read the 59M-row
    multimedia.txt -- the work queue lives in the database.
 3. Imports processed_ids.txt: for each already-finished gbifID it locates the
    downloaded file, renames legacy `<id>.jpg` to `<id>-00.jpg` so the dataset
-   uses one consistent naming scheme, and marks image index 0 as 'success'.
-   gbifIDs with more than one image are left 'partial' so the multi-image
-   downloader goes back and fetches their remaining images.
+   uses one consistent naming scheme, and marks image 0 as 'success'. gbifIDs
+   with more than one distinct image are left 'partial' so the downloader goes
+   back and fetches their remaining images.
 
    NOTE: the old one-image-per-ID downloader shuffled candidate URLs, so for a
-   multi-image gbifID we cannot know which URL the existing file came from. It
-   is recorded against img_index 0 with error_type 'legacy_unverified_index'.
-   ~87% of gbifIDs have only one image, where this assignment is exact.
+   multi-image gbifID we cannot know which image the existing file is. It is
+   recorded against image 0 with error_type 'legacy_unverified_index'.
 
 failed_ids.txt is intentionally NOT imported: those IDs stay 'pending' and get
 a fresh, fully-tracked retry.
 
 This script is destructive-ish (it renames files and can drop an existing DB
-with --reset). It does not download anything. Run it once before the first
-run of image_install_db.py.
+with --reset). It does not download anything.
 
 The legacy import is idempotent and resumable: if it is interrupted, re-run
 with --legacy-only to finish it without redoing the multimedia ingest.
@@ -69,7 +69,7 @@ def progress(msg):
 
 
 def hierarchical_path(base_dir, gbif_id, suffix=""):
-    """Mirror image_install_db.get_hierarchical_path (without makedirs)."""
+    """Path for a stored image (mirrors image_install_db.image_path, no mkdir)."""
     stem = str(gbif_id)
     prefix1 = stem[:3] if len(stem) >= 3 else stem
     prefix2 = stem[3:6] if len(stem) >= 6 else "000"
@@ -98,7 +98,7 @@ def parse_args():
 
 
 def ingest_multimedia(conn, multimedia_path):
-    """Load every image URL from multimedia.txt into images + gbif_ids."""
+    """Group multimedia.txt rows into distinct images and load images + gbif_ids."""
     print(f"Reading {multimedia_path} ...")
     df = pd.read_csv(
         multimedia_path,
@@ -111,37 +111,73 @@ def ingest_multimedia(conn, multimedia_path):
     df["identifier"] = df["identifier"].astype("string")
     print(f"  {len(df):,} (gbifID, URL) rows")
 
-    # Sort so each gbifID's rows are contiguous, then number them 0,1,2,...
+    # Stable sort -> each gbifID's rows keep their multimedia.txt order.
     df = df.sort_values("gbifID", kind="stable").reset_index(drop=True)
-    df["img_index"] = df.groupby("gbifID").cumcount()
+
+    print("  Computing canonical image keys ...")
+    df["image_key"] = df["identifier"].map(ddb.canonical_image_key).astype("string")
+
+    # image_no: dense rank of image_key within each gbifID, by first appearance.
+    df["is_new"] = ~df.duplicated(["gbifID", "image_key"])
+    df["image_no"] = df.groupby("gbifID")["is_new"].cumsum().astype("int32") - 1
+
+    # Order a distinct image's candidate URLs: highest resolution first, IIIF
+    # manifests last (they are only a fallback -- expanded at download time).
+    df["is_manifest"] = df["identifier"].str.contains(
+        "/manifest", case=False, na=False).astype("int8")
+    size = pd.to_numeric(
+        df["identifier"].str.extract(r"/full/(\d+),", expand=False),
+        errors="coerce")
+    big = df["identifier"].str.contains(
+        r"/full/(?:max|full)/", case=False, na=False, regex=True)
+    size = size.where(~big, 100000)
+    size = size.mask(df["is_manifest"] == 1, 1600)   # manifest expands to ~1600
+    df["eff_size"] = size.fillna(0).astype("int32")
+
     df["host"] = (
         df["identifier"].str.extract(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/:]+)",
                                      expand=False)
-        .fillna("")
+        .fillna("").astype("string")
     )
+
+    df = df.sort_values(
+        ["gbifID", "image_no", "eff_size", "is_manifest"],
+        ascending=[True, True, False, True], kind="stable")
+
+    print("  Grouping rows into distinct images ...")
+    images = (
+        df.groupby(["gbifID", "image_no"], sort=True)
+        .agg(urls=("identifier", "\n".join),
+             image_key=("image_key", "first"),
+             host=("host", "first"))
+        .reset_index()
+    )
+    del df
+    print(f"    {len(images):,} distinct images")
 
     print("  Inserting image rows ...")
     inserted = 0
-    for start in range(0, len(df), INSERT_BATCH):
-        sub = df.iloc[start:start + INSERT_BATCH]
+    for start in range(0, len(images), INSERT_BATCH):
+        sub = images.iloc[start:start + INSERT_BATCH]
         rows = list(zip(
             sub["gbifID"].tolist(),
-            sub["img_index"].tolist(),
-            sub["identifier"].tolist(),
+            sub["image_no"].tolist(),
+            sub["image_key"].tolist(),
+            sub["urls"].tolist(),
             sub["host"].tolist(),
         ))
         conn.executemany(
-            "INSERT OR IGNORE INTO images(gbif_id, img_index, url, host) "
-            "VALUES(?,?,?,?)",
+            "INSERT OR IGNORE INTO images"
+            "(gbif_id, image_no, image_key, urls, host) VALUES(?,?,?,?,?)",
             rows,
         )
         conn.commit()
         inserted += len(rows)
-        progress(f"    {inserted:,}/{len(df):,} image rows")
-    print(f"    {inserted:,} image rows inserted        ")
+        progress(f"    {inserted:,}/{len(images):,} image rows")
+    print(f"    {inserted:,} distinct images inserted        ")
 
     print("  Inserting gbifID rows ...")
-    sizes = df.groupby("gbifID").size()
+    sizes = images.groupby("gbifID").size()
     gid_rows = list(zip(sizes.index.tolist(), sizes.tolist()))
     for start in range(0, len(gid_rows), INSERT_BATCH):
         conn.executemany(
@@ -173,7 +209,7 @@ def import_legacy(conn, processed_file, install_path):
                     "UPDATE images SET status='success', "
                     "  error_type=?, file_path=?, file_size=?, "
                     "  last_attempt_at=datetime('now') "
-                    "WHERE gbif_id=? AND img_index=0",
+                    "WHERE gbif_id=? AND image_no=0",
                     batch,
                 )
                 conn.commit()

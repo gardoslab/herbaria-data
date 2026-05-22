@@ -11,13 +11,15 @@ This directory contains utility scripts for managing herbarium specimen images, 
 ### Image Download & Installation
 
 #### `image_install_db.py`
-**Purpose**: Current script for downloading herbarium specimen images from GBIF (Global Biodiversity Information Facility) multimedia datasets. Downloads **all** images per gbifID, each saved as `<gbifID>-NN.jpg`, with status tracked in a SQLite database. See [DEPLOYMENT.md](DEPLOYMENT.md) for the full procedure.
+**Purpose**: Current script for downloading herbarium specimen images from GBIF (Global Biodiversity Information Facility) multimedia datasets. Downloads one file per **distinct image** of each gbifID, saved as `<gbifID>-NN.jpg`, with status tracked in a SQLite database. See [DEPLOYMENT.md](DEPLOYMENT.md) for the full procedure.
 
 **Key Features**:
 - Parallel downloading with ThreadPoolExecutor (5 workers)
 - Host-based rate limiting and circuit breaker pattern
-- IIIF (International Image Interoperability Framework) manifest support — one file saved per source URL, highest resolution first
-- Automatic image resizing to 1024px max dimension
+- IIIF manifest support, with deduplication — a manifest plus the resolution variants of one specimen photo count as **one** image, so one file is saved, not three
+- Automatic image resizing to 1024px max-dimension JPEG
+- TIFF/PNG decoded and saved as JPEG; camera-raw **DNG kept as-is** (`<gbifID>-NN.dng`, flagged `raw_unprocessed`) rather than discarded
+- HTML/text responses (e.g. "direct download no longer supported") detected and the page text captured for follow-up
 - Atomic downloads (stream to `.tmp`, length-check, then rename) so a dropped connection never leaves a corrupt file
 - SQLite status database for resumable downloads and queryable, classified error tracking — see [`download_db.py`](download_db.py)
 - Hierarchical directory organization (3-digit prefix structure)
@@ -85,20 +87,22 @@ qsub -N image_install -l h_rt=48:00:00 -pe omp 16 -P herbdl -m beas -M your_emai
 #### `download_db.py`
 **Purpose**: SQLite-backed download-status tracking. Imported by the other download scripts — not run directly.
 
-**Why it exists**: replaces the flat `processed_ids.txt` / `failed_ids.txt` files, which recorded only an ID with no reason for failure. The database records, per image URL, whether it succeeded or failed and *why*, so failures are queryable and only transient ones get retried.
+**Why it exists**: replaces the flat `processed_ids.txt` / `failed_ids.txt` files, which recorded only an ID with no reason for failure. The database records, per distinct image, whether it succeeded or failed and *why*, so failures are queryable and only transient ones get retried.
 
 **Tables**:
-- `images` — one row per source image URL: `status`, `http_status`, `error_type`, `error_detail`, `file_path`, `file_size`, `attempts`
-- `gbif_ids` — one row per gbifID; the resumable work queue (`pending` / `partial` / `done` / `failed`)
+- `images` — one row per **distinct image** (the download unit): `image_no`, `image_key` (canonical identity), `urls` (candidate URLs), `status`, `http_status`, `error_type`, `error_detail`, `file_path`, `file_size`, `attempts`
+- `gbif_ids` — one row per gbifID; the resumable work queue (`pending` / `partial` / `done` / `failed`); `n_images` is the distinct-image count
 - `hosts` — per-host error tally and cooldown, so circuit-breaker state survives a restart
+
+`canonical_image_key()` collapses a IIIF manifest and the resolution variants of one specimen photo to a single key, so multiple `multimedia.txt` rows become one `images` row.
 
 #### `init_download_db.py`
 **Purpose**: One-time builder for the status database.
 
 **What it does**:
 1. Creates the schema
-2. Ingests `multimedia.txt` into `images` + `gbif_ids` (so later runs never re-read the 59M-row file)
-3. Imports `processed_ids.txt`: renames legacy `<id>.jpg` files to `<id>-00.jpg` for a consistent naming scheme and marks them done. Multi-image gbifIDs are left `partial` so the downloader fetches their remaining images. (`failed_ids.txt` is **not** imported — those IDs get a fresh, tracked retry.)
+2. Reads `multimedia.txt` once, groups its rows into **distinct images** (a manifest + resolution variants of one photo collapse to one), and loads `images` + `gbif_ids` — so later runs never re-read the 59M-row file
+3. Imports `processed_ids.txt`: renames legacy `<id>.jpg` files to `<id>-00.jpg` for a consistent naming scheme and marks image 0 done. Multi-image gbifIDs are left `partial` so the downloader fetches their remaining images. (`failed_ids.txt` is **not** imported — those IDs get a fresh, tracked retry.)
 
 **Usage**:
 ```bash

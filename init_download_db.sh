@@ -12,15 +12,17 @@ module load academic-ml/spring-2026
 
 conda activate spring-2026-pyt
 
+# The build mode is taken from the qsub command line. Submit with one of:
+#   qsub ... init_download_db.sh --reset         # full (re)build from scratch
+#   qsub ... init_download_db.sh --legacy-only   # only (re-)run the legacy import
 # --processed-file points at the production processed_ids.txt, which lives in
 # ljhao's working directory, not this repo.
-# --legacy-only means only process the legacy images without creating the database.
-#    Run this on subsequent times after db was created.
-python init_download_db.py --legacy-only \
+python init_download_db.py "$@" \
     --processed-file /projectnb/herbdl/workspaces/ljhao/herbdl/utils/processed_ids.txt
 
 # The other big initial run is tracked in
 # /projectnb/herbdl/workspaces/tsehou26/herbarium_project/utils/processed_ids.txt and .../failed_ids.txt
 
-### The command below is used to submit the job to the cluster
-### qsub -N init_download_db -l h_rt=12:00:00 -pe omp 16 -P herbdl -m beas -M your_email@bu.edu init_download_db.sh
+### The command below is used to submit the job to the cluster. Use --reset for
+### the first build on the new distinct-image schema; --legacy-only for later top-ups:
+### qsub -N init_download_db -l h_rt=12:00:00 -pe omp 16 -P herbdl -m beas -M your_email@bu.edu init_download_db.sh --reset

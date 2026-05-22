@@ -2,27 +2,38 @@
 Image install script: download herbarium specimen images from a GBIF
 multimedia.txt file.
 
-Downloads ALL images for each gbifID. Each source URL (a GBIF "identifier") is
-saved as one file with an index suffix: <gbifID>-00.jpg, <gbifID>-01.jpg, ...
-A gbifID is marked 'done' only once every one of its images has succeeded.
+Downloads one file per *distinct image* of each gbifID. A IIIF manifest and the
+resolution variants of one specimen photo are treated as a single image (see
+download_db.canonical_image_key) -- so a record listed in multimedia.txt as
+"manifest + 300px + 1600px" produces ONE file, not three. Files are named
+<gbifID>-00.jpg, <gbifID>-01.jpg, ... A gbifID is 'done' only once every one of
+its distinct images has succeeded.
 
 Status tracking
 ---------------
 Per-image and per-gbifID status lives in a SQLite database (download_status.db,
-see download_db.py) instead of the old processed_ids.txt / failed_ids.txt flat
-files. Build the database once with init_download_db.py before the first run.
+see download_db.py). Build it once with init_download_db.py before the first run.
 
 The database lets the script:
   * resume without re-reading the 59M-row multimedia.txt every run,
   * retry only transient failures (timeout / rate-limit / 5xx / dropped
     connection), capped at MAX_ATTEMPTS, and never re-hammer permanent 404s,
-  * record *why* each download failed so failures are queryable afterwards
-    (see status_report.py).
+  * record *why* each download failed so failures are queryable afterwards.
+
+Non-JPEG handling
+-----------------
+TIFF/PNG/etc. are decoded by Pillow and saved as resized JPEG like everything
+else. A file Pillow cannot decode but that is a real image format (camera-raw
+DNG) is kept as-is (<gbifID>-NN.dng) and flagged 'raw_unprocessed' for a later
+conversion pass -- it is not discarded. A URL that returns an HTML/text page
+(e.g. "direct download no longer supported") is recorded as
+'invalid_content_type' with the page text captured for follow-up.
 
 Accurate as of May 2026.
 """
 
 import os
+import re
 import sys
 import time
 import random
@@ -46,8 +57,7 @@ import download_db as ddb
 from download_db import DownloadDB
 
 # verify=False is needed because many herbarium hosts have broken TLS certs.
-# Suppress the resulting per-request warning so it does not flood the .e log
-# (it previously produced ~134 MB of InsecureRequestWarning spam per run).
+# Suppress the resulting per-request warning so it does not flood the .e log.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---- configuration -----------------------------------------------------------
@@ -62,6 +72,10 @@ MIN_IMAGE_MB = 0.01          # files smaller than this are treated as invalid
 HOST_COOLDOWN_DEFAULT = 30 * 60
 HOST_COOLDOWN_TIMEOUT = 60 * 60
 HOST_ERROR_THRESHOLD = 500   # circuit breaker: skip a host after this many errors
+
+# Extensions under which an undecodable-but-real image is kept for later.
+RAW_EXTS = (".dng", ".nef", ".cr2", ".cr3", ".arw", ".raf", ".orf", ".rw2",
+            ".tif", ".raw")
 
 # ---- in-memory host circuit-breaker state (seeded from / saved to the DB) ----
 
@@ -107,18 +121,23 @@ def progress(msg):
 
 # ---- paths -------------------------------------------------------------------
 
-def get_hierarchical_path(base_dir, gbif_id, suffix, ext=".jpg"):
+def image_path(gbif_id, image_no, ext):
     """
-    Build a hierarchical storage path to avoid millions of files in one dir.
-    suffix: image index suffix, e.g. '-00', '-01'.
-    Example: gbifID=1057161997, suffix='-00' -> <base>/105/716/1057161997-00.jpg
+    Storage path for one image: <base>/<p1>/<p2>/<gbifID>-NN<ext> (no mkdir).
+    p1 = first 3 digits of the gbifID, p2 = digits 4-6.
     """
     stem = str(gbif_id)
     prefix1 = stem[:3] if len(stem) >= 3 else stem
     prefix2 = stem[3:6] if len(stem) >= 6 else "000"
-    dest_dir = os.path.join(base_dir, prefix1, prefix2)
-    os.makedirs(dest_dir, exist_ok=True)
-    return os.path.join(dest_dir, f"{stem}{suffix}{ext}")
+    return os.path.join(INSTALL_PATH, prefix1, prefix2,
+                        f"{stem}-{image_no:02d}{ext}")
+
+
+def _rm(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # ---- host circuit breaker / cooldown -----------------------------------------
@@ -181,13 +200,17 @@ def block_host(url, retry_after=None, timeout_issue=False):
 
 # ---- IIIF manifests ----------------------------------------------------------
 
+def is_manifest_url(url):
+    low = url.lower()
+    return "/manifest" in low or low.endswith(".json")
+
+
 def extract_image_from_iiif_manifest(manifest_url, gbif_id):
     """
     Fetch a IIIF manifest and return (image_urls, error_type).
 
     image_urls is an ordered list of direct image URLs (highest resolution
-    first). On failure image_urls is empty and error_type explains why, so the
-    caller can decide whether the manifest is worth retrying.
+    first). On failure image_urls is empty and error_type explains why.
     """
     try:
         response = session.get(
@@ -233,30 +256,95 @@ def extract_image_from_iiif_manifest(manifest_url, gbif_id):
         return [], ddb.ERR_MANIFEST
 
 
+# ---- non-image response detection -------------------------------------------
+
+_NON_IMAGE_CTYPES = ("text/html", "text/plain", "text/xml",
+                     "application/xml", "application/json", "ld+json")
+
+
+def _is_non_image_ctype(ctype):
+    return bool(ctype) and any(t in ctype for t in _NON_IMAGE_CTYPES)
+
+
+def _looks_like_text(data):
+    """Heuristic: do the first bytes look like an HTML / XML / JSON document?"""
+    if not data:
+        return False
+    head = data.lstrip()[:64].lower()
+    return head.startswith((b"<!doctype", b"<html", b"<head", b"<body",
+                            b"<?xml", b"{", b"["))
+
+
+def _read_bounded(resp, limit=16384):
+    """Read at most `limit` bytes of a streamed response body."""
+    raw = b""
+    for chunk in resp.iter_content(chunk_size=8192):
+        raw += chunk
+        if len(raw) >= limit:
+            break
+    return raw[:limit]
+
+
+def _join_bounded(stream, limit=16384):
+    """Drain at most `limit` bytes from an iter_content generator."""
+    raw = b""
+    for chunk in stream:
+        raw += chunk
+        if len(raw) >= limit:
+            break
+    return raw[:limit]
+
+
+def _html_to_text(raw):
+    """Strip an HTML/text body down to readable text for capture in the DB."""
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        text = str(raw)
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:1800]
+
+
+def raw_keep_extension(content_type, url):
+    """
+    Extension under which to keep an image Pillow could not decode, or None to
+    discard it. Camera-raw DNG is the main case -- kept for a later conversion
+    pass rather than lost.
+    """
+    ct = (content_type or "").lower()
+    low = (url or "").lower().split("?")[0]
+    if "dng" in ct or low.endswith(".dng"):
+        return ".dng"
+    for ext in (".nef", ".cr2", ".cr3", ".arw", ".raf", ".orf", ".rw2"):
+        if low.endswith(ext):
+            return ext
+    if "tiff" in ct or "tif" in ct or low.endswith((".tif", ".tiff")):
+        return ".tif"
+    if ct.startswith("image/"):
+        return ".raw"        # an image/* type Pillow cannot read -- keep it anyway
+    return None
+
+
 # ---- downloading -------------------------------------------------------------
 
-def _rm(path):
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
-def download_one_url(gbif_id, image_url, local_path):
+def download_one_url(gbif_id, image_url, tmp_path):
     """
-    Download a single URL to local_path, atomically.
+    Download one URL to tmp_path. Returns a dict:
+      success -> {ok: True, host, http_status, content_type, size}
+      failure -> {ok: False, host, http_status, content_type, size,
+                  error_type, error_detail}
 
-    Bytes are streamed to a .tmp file, length-checked against Content-Length,
-    then renamed into place -- so a dropped connection never leaves a corrupt
-    file behind. Returns a result dict with keys: ok, size, http_status,
-    error_type, error_detail, host.
+    Detects HTML/text responses -- including ones disguised with an image
+    Content-Type -- and captures the page text into error_detail.
     """
     host = _host_from_url(image_url)
-    tmp_path = local_path + ".tmp"
 
-    def fail(error_type, detail, http_status=None):
-        return {"ok": False, "size": None, "http_status": http_status,
-                "error_type": error_type, "error_detail": detail, "host": host}
+    def fail(error_type, detail, http_status=None, content_type=None):
+        return {"ok": False, "host": host, "http_status": http_status,
+                "content_type": content_type, "size": None,
+                "error_type": error_type, "error_detail": detail}
 
     try:
         time.sleep(random.uniform(0.2, 0.8))
@@ -283,15 +371,36 @@ def download_one_url(gbif_id, image_url, local_path):
                 return fail(ddb.http_error_type(status), f"HTTP {status}", status)
 
             ctype = (resp.headers.get("Content-Type") or "").lower()
-            if ctype and any(bad in ctype for bad in
-                             ("text/html", "text/plain", "application/xml")):
+
+            # Content-Type clearly says this is not an image -> capture the text.
+            if _is_non_image_ctype(ctype):
                 increment_host_errors(image_url)
-                return fail(ddb.ERR_INVALID_CONTENT, f"Content-Type: {ctype}", status)
+                snippet = _html_to_text(_read_bounded(resp))
+                return fail(ddb.ERR_INVALID_CONTENT,
+                            f"[{ctype}] {snippet}", status, ctype)
+
+            # Sniff the first chunk: some hosts serve an HTML notice ("direct
+            # download no longer supported ...") with an image/* Content-Type.
+            stream = resp.iter_content(chunk_size=65536)
+            first = b""
+            for chunk in stream:
+                if chunk:
+                    first = chunk
+                    break
+            if _looks_like_text(first):
+                increment_host_errors(image_url)
+                snippet = _html_to_text(first + _join_bounded(stream))
+                return fail(ddb.ERR_INVALID_CONTENT,
+                            f"[non-image body, {ctype or 'no Content-Type'}] "
+                            f"{snippet}", status, ctype)
 
             expected = resp.headers.get("Content-Length")
             written = 0
             with open(tmp_path, "wb") as out:
-                for chunk in resp.iter_content(chunk_size=65536):
+                if first:
+                    out.write(first)
+                    written += len(first)
+                for chunk in stream:
                     if chunk:
                         out.write(chunk)
                         written += len(chunk)
@@ -302,17 +411,17 @@ def download_one_url(gbif_id, image_url, local_path):
                         _rm(tmp_path)
                         return fail(ddb.ERR_TRUNCATED,
                                     f"expected {expected} bytes, got {written}",
-                                    status)
+                                    status, ctype)
                 except ValueError:
                     pass
 
             if written < 1024:
                 _rm(tmp_path)
-                return fail(ddb.ERR_TRUNCATED, f"only {written} bytes", status)
+                return fail(ddb.ERR_TRUNCATED, f"only {written} bytes",
+                            status, ctype)
 
-            os.replace(tmp_path, local_path)
-            return {"ok": True, "size": written, "http_status": status,
-                    "error_type": None, "error_detail": None, "host": host}
+            return {"ok": True, "host": host, "http_status": status,
+                    "content_type": ctype, "size": written}
 
     except (ConnectTimeout, ReadTimeout, Timeout) as e:
         _rm(tmp_path)
@@ -330,79 +439,99 @@ def download_one_url(gbif_id, image_url, local_path):
         return fail(ddb.ERR_OTHER, str(e))
 
 
-def resize_image(gbif_id, local_path):
-    changed, new_size = resize_with_aspect_ratio(
-        local_path, local_path, max_size=1024, format="JPEG", quality=85)
-    if changed:
-        logger.info(f"Resized {gbif_id} to {new_size} at {local_path}")
+def _finalize_download(gbif_id, image_no, image_url, res, tmp_path):
+    """Turn a downloaded temp file into the final image, or keep it raw."""
+    try:
+        # Decode + resize as a normal image (JPEG/TIFF/PNG/...), in place.
+        resize_with_aspect_ratio(tmp_path, tmp_path, max_size=1024,
+                                 format="JPEG", quality=85)
+    except (OSError, UnidentifiedImageError) as e:
+        # Pillow cannot decode it. If it is a real image format (DNG etc.),
+        # keep the raw file for a later conversion pass; otherwise discard.
+        ext = raw_keep_extension(res["content_type"], image_url)
+        if ext:
+            raw_path = image_path(gbif_id, image_no, ext)
+            os.replace(tmp_path, raw_path)
+            try:
+                size = os.path.getsize(raw_path)
+            except OSError:
+                size = res["size"]
+            logger.warning(f"Kept raw image {gbif_id} #{image_no} "
+                           f"({res['content_type']}) at {raw_path}")
+            return {"outcome": "success", "db_status": ddb.ST_SUCCESS,
+                    "http_status": 200, "error_type": ddb.ERR_RAW_UNPROCESSED,
+                    "error_detail": f"kept raw: {res['content_type'] or 'unknown'}",
+                    "host": res["host"], "file_path": raw_path, "file_size": size}
+        _rm(tmp_path)
+        return {"outcome": "failed", "db_status": ddb.ST_FAILED_PERMANENT,
+                "http_status": 200, "error_type": ddb.ERR_NOT_IMAGE,
+                "error_detail": str(e), "host": res["host"],
+                "file_path": None, "file_size": None}
+
+    jpg_path = image_path(gbif_id, image_no, ".jpg")
+    os.replace(tmp_path, jpg_path)
+    try:
+        size = os.path.getsize(jpg_path)
+    except OSError:
+        size = res["size"]
+    return {"outcome": "success", "db_status": ddb.ST_SUCCESS, "http_status": 200,
+            "error_type": None, "error_detail": None, "host": res["host"],
+            "file_path": jpg_path, "file_size": size}
 
 
-def resolve_and_download(gbif_id, identifier_url, local_path):
+def resolve_and_download(gbif_id, image_no, candidate_urls):
     """
-    Download the image for one source identifier (one img_index) and save it as
-    exactly one file at local_path.
+    Fetch one distinct image and save it as exactly one file.
 
-    For a plain URL there is one candidate. For a IIIF manifest the manifest is
-    expanded into resolution variants and tried highest-first; the first success
-    wins, so still only one file is saved per identifier.
-
-    Returns a result dict with keys: outcome ('success' | 'failed' |
-    'deferred'), db_status, http_status, error_type, error_detail, host,
-    file_size. 'deferred' means every candidate host was blocked/circuit-broken,
-    so the image was not really attempted and should stay 'pending'.
+    candidate_urls are this image's URLs from the database, best-resolution
+    first. IIIF manifests among them are expanded into image URLs. The first
+    URL that yields a usable image wins. Returns an outcome dict; outcome is
+    'success', 'failed', or 'deferred' (every candidate host was blocked, so
+    the image was not really attempted and should stay 'pending').
     """
-    if "/manifest" in identifier_url or identifier_url.endswith(".json"):
-        candidates, manifest_err = extract_image_from_iiif_manifest(
-            identifier_url, gbif_id)
-        if not candidates:
-            return {"outcome": "failed",
-                    "db_status": ddb.status_for_error(manifest_err),
-                    "http_status": None, "error_type": manifest_err,
-                    "error_detail": "IIIF manifest yielded no image URLs",
-                    "host": _host_from_url(identifier_url), "file_size": None}
-    else:
-        candidates = [identifier_url]
+    resolved, manifest_err = [], None
+    for url in candidate_urls:
+        if is_manifest_url(url):
+            extracted, err = extract_image_from_iiif_manifest(url, gbif_id)
+            if extracted:
+                resolved.extend(extracted)
+            elif err:
+                manifest_err = err
+        else:
+            resolved.append(url)
 
-    # Deduplicate while preserving the highest-resolution-first order.
     seen, ordered = set(), []
-    for url in candidates:
+    for url in resolved:
         if url not in seen:
             seen.add(url)
             ordered.append(url)
 
-    failures = []
-    attempted_any = False
+    if not ordered:
+        et = manifest_err or ddb.ERR_NO_URL
+        return {"outcome": "failed", "db_status": ddb.status_for_error(et),
+                "http_status": None, "error_type": et,
+                "error_detail": "no downloadable image URL for this image",
+                "host": None, "file_path": None, "file_size": None}
+
+    tmp_path = image_path(gbif_id, image_no, ".tmp")
+    os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+
+    failures, attempted = [], False
     for url in ordered:
         if is_host_circuit_broken(url) or is_host_blocked(url):
             continue
-        attempted_any = True
-        result = download_one_url(gbif_id, url, local_path)
-        if result["ok"]:
-            try:
-                resize_image(gbif_id, local_path)
-            except (OSError, UnidentifiedImageError) as e:
-                _rm(local_path)
-                return {"outcome": "failed", "db_status": ddb.ST_FAILED_PERMANENT,
-                        "http_status": result["http_status"],
-                        "error_type": ddb.ERR_NOT_IMAGE,
-                        "error_detail": str(e), "host": result["host"],
-                        "file_size": None}
-            try:
-                size = os.path.getsize(local_path)
-            except OSError:
-                size = result["size"]
-            return {"outcome": "success", "db_status": ddb.ST_SUCCESS,
-                    "http_status": 200, "error_type": None,
-                    "error_detail": None, "host": result["host"],
-                    "file_size": size}
-        failures.append(result)
+        attempted = True
+        res = download_one_url(gbif_id, url, tmp_path)
+        if res["ok"]:
+            return _finalize_download(gbif_id, image_no, url, res, tmp_path)
+        failures.append(res)
 
-    if not attempted_any:
+    if not attempted:
         # Every candidate's host was blocked -- leave the image 'pending'.
         return {"outcome": "deferred"}
 
     # Prefer a transient failure as the recorded reason: if any candidate could
-    # still succeed later, the whole identifier is worth retrying.
+    # still succeed later, the whole image is worth retrying.
     transient = [f for f in failures if not ddb.is_permanent(f["error_type"])]
     chosen = transient[0] if transient else failures[0]
     db_status = ddb.ST_FAILED_TRANSIENT if transient else ddb.ST_FAILED_PERMANENT
@@ -410,17 +539,30 @@ def resolve_and_download(gbif_id, identifier_url, local_path):
             "http_status": chosen["http_status"],
             "error_type": chosen["error_type"],
             "error_detail": chosen["error_detail"],
-            "host": chosen["host"], "file_size": None}
+            "host": chosen["host"], "file_path": None, "file_size": None}
 
 
 # ---- per-gbifID processing ---------------------------------------------------
 
+def _existing_file(gbif_id, image_no):
+    """Return (path, is_raw) if a valid file is already on disk, else None."""
+    for ext in (".jpg",) + RAW_EXTS:
+        path = image_path(gbif_id, image_no, ext)
+        if os.path.exists(path):
+            try:
+                if get_file_size_in_mb(path) >= MIN_IMAGE_MB:
+                    return path, (ext != ".jpg")
+            except OSError:
+                pass
+    return None
+
+
 def process_id(db, gbif_id, total_to_install):
-    """Download every not-yet-done image for one gbifID and update the DB."""
+    """Download every not-yet-done distinct image for one gbifID."""
     global n_installed
     images = db.get_images_for(gbif_id)
 
-    for img_index, url, _host, status, attempts in images:
+    for image_no, image_key, urls_str, host, status, attempts in images:
         # Skip images that are already finished or have exhausted their retries.
         if status == ddb.ST_SUCCESS:
             continue
@@ -429,33 +571,33 @@ def process_id(db, gbif_id, total_to_install):
         if status == ddb.ST_FAILED_TRANSIENT and attempts >= db.max_attempts:
             continue
 
-        suffix = f"-{img_index:02d}"
-        local_path = get_hierarchical_path(INSTALL_PATH, gbif_id, suffix)
-
-        # If a valid file is already on disk, record it without downloading.
-        if os.path.exists(local_path):
+        # If a valid file is already on disk (a previous run, or the legacy
+        # import), record it without downloading.
+        existing = _existing_file(gbif_id, image_no)
+        if existing:
+            path, is_raw = existing
             try:
-                size_mb = get_file_size_in_mb(local_path)
+                size = os.path.getsize(path)
             except OSError:
-                size_mb = 0.0
-            if size_mb >= MIN_IMAGE_MB:
-                db.record_image_result(
-                    gbif_id, img_index, ddb.ST_SUCCESS,
-                    host=_host_from_url(url), http_status=200,
-                    file_path=local_path, file_size=int(size_mb * 1024 * 1024),
-                    increment_attempts=False)
-                continue
+                size = None
+            db.record_image_result(
+                gbif_id, image_no, ddb.ST_SUCCESS, host=host, http_status=200,
+                error_type=ddb.ERR_RAW_UNPROCESSED if is_raw else None,
+                file_path=path, file_size=size, increment_attempts=False)
+            continue
 
-        result = resolve_and_download(gbif_id, url, local_path)
+        candidate_urls = [u for u in urls_str.split("\n") if u]
+        result = resolve_and_download(gbif_id, image_no, candidate_urls)
         if result["outcome"] == "deferred":
             continue  # host blocked; leave 'pending' for a later run
 
         db.record_image_result(
-            gbif_id, img_index, result["db_status"],
-            host=result.get("host"), http_status=result.get("http_status"),
+            gbif_id, image_no, result["db_status"],
+            host=result.get("host") or host,
+            http_status=result.get("http_status"),
             error_type=result.get("error_type"),
             error_detail=result.get("error_detail"),
-            file_path=local_path if result["outcome"] == "success" else None,
+            file_path=result.get("file_path"),
             file_size=result.get("file_size"))
 
         if result["outcome"] == "success":
@@ -525,6 +667,7 @@ def main():
     send_notification("Image Installation",
                       f"Starting run: {total_to_install} gbifIDs to process.")
 
+    counts = {}
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for start in range(0, total_to_install, WORK_CHUNK):

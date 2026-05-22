@@ -14,9 +14,12 @@ environment.
 
 | Before | After |
 |---|---|
-| Progress in `processed_ids.txt` / `failed_ids.txt` (ID only, no reason) | Progress in `download_status.db` — every URL's outcome and *why* it failed |
+| Progress in `processed_ids.txt` / `failed_ids.txt` (ID only, no reason) | Progress in `download_status.db` — every image's outcome and *why* it failed |
 | `multimedia.txt` re-read and re-grouped with pandas every run | Ingested into the DB once; later runs query the work queue |
+| One file per multimedia row (a manifest + its resolution variants → 3 files) | One file per **distinct image** — IIIF manifest/resolution variants deduplicated |
 | Failed IDs all retried blindly (or skipped) | Only transient failures retried (timeout/rate-limit/5xx/dropped connection), capped at 4 attempts |
+| Camera-raw DNG silently discarded | DNG kept as `<id>-NN.dng`, flagged `raw_unprocessed` for a later conversion pass |
+| HTML "download not supported" pages saved as junk `.jpg` | Detected; the page text is captured in `error_detail` for follow-up |
 | `analyze_image_progress.py` (slow, loads ~180 MB of text) | `status_report.py` (instant SQL queries) |
 | ~1.4 GB run logs, ~134 MB warning spam | `WARNING`-level log only; warning spam suppressed |
 
@@ -48,6 +51,11 @@ never committed:
 
 This step ingests `multimedia.txt`, imports already-completed downloads from
 `processed_ids.txt`, and renames legacy `<id>.jpg` files to `<id>-00.jpg`.
+
+> **If a `download_status.db` already exists from before the distinct-image
+> change**, it has the old schema and must be rebuilt — run the builder with
+> `--reset`. Files already on disk are detected and re-used, so this re-discovers
+> existing progress; it does not re-download anything.
 
 It is heavy — it reads the ~59M-row `multimedia.txt` with pandas and renames up
 to ~13.5M files. **Run it as a batch job, not on a login node.**
@@ -146,8 +154,17 @@ sqlite3 /projectnb/herbdl/data/GBIF-F25h/download_status.db
 SELECT error_type, COUNT(*) FROM images
 WHERE status LIKE 'failed%' GROUP BY error_type ORDER BY 2 DESC;
 
--- URLs still worth retrying
-SELECT gbif_id, url FROM images WHERE status='failed_transient' LIMIT 50;
+-- images still worth retrying
+SELECT gbif_id, image_no, urls FROM images
+WHERE status='failed_transient' LIMIT 50;
+
+-- URLs that returned an HTML/text page, with the captured message
+SELECT host, error_detail FROM images
+WHERE error_type='invalid_content_type' GROUP BY host;
+
+-- raw files (DNG etc.) kept for a later conversion pass
+SELECT gbif_id, image_no, file_path FROM images
+WHERE error_type='raw_unprocessed';
 
 -- hosts currently in cooldown
 SELECT host, datetime(blocked_until,'unixepoch') FROM hosts
@@ -187,6 +204,17 @@ UPDATE gbif_ids SET status='partial' WHERE status='failed';
   The old downloader shuffled URLs, so the exact source URL is unknown. This is
   exact for the ~87% of gbifIDs that have only one image; for the rest it
   affects only metadata, not the image files.
+- **Non-IIIF duplicates are not deduplicated.** Two distinct non-IIIF URLs on
+  one gbifID stay separate images — metadata cannot tell whether they are the
+  same photo at different sizes. Only content hashing could, and that is not
+  done here.
+- **Raw DNG files are kept, not converted.** A camera-raw DNG is saved as
+  `<id>-NN.dng` with `error_type='raw_unprocessed'` (the row still counts as
+  `success`). Converting them to JPEG-1024 is a later pass and needs a raw
+  decoder (`rawpy`) added to the environment. Query them with
+  `WHERE error_type='raw_unprocessed'`.
+- **HTML/non-image responses** are recorded `invalid_content_type` with the page
+  text captured in `error_detail`; `status_report.py` lists them by host.
 - **Database size.** Expect ~10–15 GB. It sits in the data directory, not the
   repo. Ensure the `herbdl` project has the space.
 - **Single job at a time.** SQLite (WAL mode) is fine for one job with 5 worker
