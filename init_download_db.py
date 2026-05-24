@@ -40,6 +40,7 @@ Usage
 
 import os
 import sys
+import gc
 import time
 import sqlite3
 import argparse
@@ -144,48 +145,66 @@ def ingest_multimedia(conn, multimedia_path):
         ["gbifID", "image_no", "eff_size", "is_manifest"],
         ascending=[True, True, False, True], kind="stable")
 
-    print("  Grouping rows into distinct images ...")
-    images = (
-        df.groupby(["gbifID", "image_no"], sort=True)
-        .agg(urls=("identifier", "\n".join),
-             image_key=("image_key", "first"),
-             host=("host", "first"))
-        .reset_index()
-    )
-    del df
-    print(f"    {len(images):,} distinct images")
+    print("  Streaming distinct images into the database ...")
+    # Single-pass streaming groupby. The previous pandas
+    # .agg('\n'.join, ...) over ~52M groups was the bottleneck (did not
+    # finish inside a 12 h job). Pull the sorted columns into native
+    # Python lists and emit one INSERT batch per chunk of distinct images.
+    gid_l  = df["gbifID"].tolist();     del df["gbifID"]
+    no_l   = df["image_no"].tolist();   del df["image_no"]
+    url_l  = df["identifier"].tolist(); del df["identifier"]
+    key_l  = df["image_key"].tolist();  del df["image_key"]
+    host_l = df["host"].tolist();       del df
+    gc.collect()
+    n_rows = len(gid_l)
 
-    print("  Inserting image rows ...")
-    inserted = 0
-    for start in range(0, len(images), INSERT_BATCH):
-        sub = images.iloc[start:start + INSERT_BATCH]
-        rows = list(zip(
-            sub["gbifID"].tolist(),
-            sub["image_no"].tolist(),
-            sub["image_key"].tolist(),
-            sub["urls"].tolist(),
-            sub["host"].tolist(),
-        ))
+    img_batch = []
+    distinct = 0
+    cur_gid = cur_no = None
+    cur_key = cur_host = None
+    cur_urls = []
+
+    def flush():
+        if not img_batch:
+            return
         conn.executemany(
             "INSERT OR IGNORE INTO images"
             "(gbif_id, image_no, image_key, urls, host) VALUES(?,?,?,?,?)",
-            rows,
-        )
+            img_batch)
         conn.commit()
-        inserted += len(rows)
-        progress(f"    {inserted:,}/{len(images):,} image rows")
-    print(f"    {inserted:,} distinct images inserted        ")
+        img_batch.clear()
 
-    print("  Inserting gbifID rows ...")
-    sizes = images.groupby("gbifID").size()
-    gid_rows = list(zip(sizes.index.tolist(), sizes.tolist()))
-    for start in range(0, len(gid_rows), INSERT_BATCH):
-        conn.executemany(
-            "INSERT OR IGNORE INTO gbif_ids(gbif_id, n_images) VALUES(?,?)",
-            gid_rows[start:start + INSERT_BATCH],
-        )
-        conn.commit()
-    print(f"    {len(gid_rows):,} gbifIDs inserted")
+    for i in range(n_rows):
+        g = gid_l[i]
+        n = no_l[i]
+        if g != cur_gid or n != cur_no:
+            if cur_gid is not None:
+                img_batch.append((cur_gid, cur_no, cur_key,
+                                  "\n".join(cur_urls), cur_host))
+                distinct += 1
+                if len(img_batch) >= INSERT_BATCH:
+                    flush()
+                    progress(f"    {distinct:,} images inserted "
+                             f"({100 * i / n_rows:.1f}% through input)")
+            cur_gid, cur_no = g, n
+            cur_key, cur_host = key_l[i], host_l[i]
+            cur_urls = [url_l[i]]
+        else:
+            cur_urls.append(url_l[i])
+    if cur_gid is not None:
+        img_batch.append((cur_gid, cur_no, cur_key,
+                          "\n".join(cur_urls), cur_host))
+        distinct += 1
+    flush()
+    print(f"    {distinct:,} distinct images inserted        ")
+
+    print("  Populating gbif_ids from images ...")
+    conn.execute(
+        "INSERT INTO gbif_ids(gbif_id, n_images) "
+        "SELECT gbif_id, COUNT(*) FROM images GROUP BY gbif_id")
+    conn.commit()
+    n_gbif = conn.execute("SELECT COUNT(*) FROM gbif_ids").fetchone()[0]
+    print(f"    {n_gbif:,} gbifIDs inserted")
 
 
 def import_legacy(conn, processed_file, install_path):
