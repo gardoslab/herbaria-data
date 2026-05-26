@@ -69,3 +69,16 @@ You can send a JSON object to `https://api.gbif.org/v1/occurrence/download/reque
 ### Pro-Tip for Data Handling
 
 Once your download is processed and unzipped, the `multimedia.txt` file will serve as your master list for image links, which you can link back to the metadata in `occurrence.txt` using the shared `gbifID` column. If you are using Python, you can also use the [`plantnet/gbif-dl`](https://www.google.com/search?q=%5Bhttps://github.com/plantnet/gbif-dl%5D(https://github.com/plantnet/gbif-dl)) library specifically designed to parse these queries and download the image assets efficiently.
+
+---
+
+### Next: download the images for this project
+
+Once you have a fresh `multimedia.txt`, place it at
+`/projectnb/herbdl/data/GBIF-F25/multimedia.txt` and follow
+[DEPLOYMENT.md](../DEPLOYMENT.md) — it builds a SQLite status database from the
+file (one row per *distinct image*, with IIIF manifest + resolution variants
+deduplicated), imports any prior `processed_ids.txt` progress, and runs the
+parallel downloader. The build has three resumable stages (ingest, legacy
+import, finalize), each with its own `--reset` / `--legacy-only` /
+`--finalize-only` flag.

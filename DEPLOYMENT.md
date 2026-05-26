@@ -61,16 +61,20 @@ It is heavy — it reads the ~59M-row `multimedia.txt` with pandas and renames u
 to ~13.5M files. **Run it as a batch job, not on a login node.**
 
 ```bash
+# fresh build (use --reset if a DB already exists at the destination):
 qsub -N init_download_db -l h_rt=12:00:00 -pe omp 16 -P herbdl \
-     -m beas -M your_email@bu.edu init_download_db.sh
+     -m beas -M your_email@bu.edu init_download_db.sh --reset
 ```
 
-`init_download_db.sh` runs:
+`init_download_db.sh` forwards its arguments through to the python script:
 
 ```bash
-python init_download_db.py \
+python init_download_db.py "$@" \
     --processed-file /projectnb/herbdl/workspaces/ljhao/herbdl/utils/processed_ids.txt
 ```
+
+So `qsub ... init_download_db.sh --reset`, `... --legacy-only`, and
+`... --finalize-only` all work without editing the wrapper.
 
 > **Important:** the production `processed_ids.txt` (~13.5M IDs) lives in
 > ljhao's working directory, not in this repo. The wrapper already points there.
@@ -84,6 +88,7 @@ python init_download_db.py \
 | `python init_download_db.py` | Build DB + import legacy progress |
 | `python init_download_db.py --skip-legacy` | Build DB only (everything starts `pending`) |
 | `python init_download_db.py --legacy-only` | Skip the ingest; only (re-)run the legacy import on an existing DB |
+| `python init_download_db.py --finalize-only` | Skip ingest and disk re-scan; only (re-)roll `images.status` up into `gbif_ids.status` |
 | `python init_download_db.py --reset` | Delete an existing DB and rebuild from scratch |
 
 **Expected output** — a status breakdown, e.g.:
@@ -100,10 +105,16 @@ Final gbifID status counts:
 - `pending` — never attempted
 
 Re-running is safe: file renames and database updates are idempotent
-(already-renamed files are detected and reused). If the **ingest** fails partway,
-re-run with `--reset`. If only the **legacy import** fails partway (e.g. it was
-interrupted), re-run with `--legacy-only` — that finishes the import without
-redoing the hour-long ingest.
+(already-renamed files are detected and reused). The build has three resumable
+stages:
+
+1. **Ingest** (`multimedia.txt` → `images`/`gbif_ids`). If it fails partway,
+   re-run with `--reset`.
+2. **Legacy import** (disk re-scan + mark image 0 success per gbifID). If
+   killed partway, re-run with `--legacy-only` — skips the hour-long ingest.
+3. **Finalize** (roll `images.status` up into `gbif_ids.status` in 50k-row
+   batches). If killed partway, re-run with `--finalize-only` — skips ingest
+   AND the disk re-scan; takes well under an hour.
 
 ---
 
@@ -241,5 +252,6 @@ must be re-run.
 | `Database already exists` from the builder | Intended guard — `--reset` to rebuild, or `--legacy-only` to just (re-)run the legacy import. |
 | `database is locked` | The builder now uses WAL mode (readers do not block the writer) and a 120 s busy timeout, so this should not recur. If the legacy import was interrupted by it, finish it with `init_download_db.py --legacy-only`. Still avoid running two writers against one DB. |
 | Legacy import interrupted partway | Re-run `init_download_db.py --legacy-only` — it is idempotent and skips the hour-long ingest. |
+| Killed during "Recomputing gbifID statuses" | Re-run with `--finalize-only` — it skips ingest and the disk re-scan, commits every 50k gbif_ids, and finishes in under an hour. The previous one-shot `UPDATE` (correlated subqueries + `IN (SELECT DISTINCT …)`) didn't finish in 24h; the chunked replacement does. |
 | Builder runs out of memory | `multimedia.txt` is large; request more memory (e.g. a larger `-pe omp` slot count). |
 | Legacy progress not imported | `--processed-file` was not pointed at ljhao's `processed_ids.txt`. |
