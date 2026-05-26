@@ -29,12 +29,15 @@ with --reset). It does not download anything.
 
 The legacy import is idempotent and resumable: if it is interrupted, re-run
 with --legacy-only to finish it without redoing the multimedia ingest.
+The final "roll up images.status into gbif_ids" step is also resumable on its
+own -- re-run with --finalize-only to redo just that, no disk re-scan.
 
 Usage
 -----
     python init_download_db.py                 # build DB + import legacy
     python init_download_db.py --skip-legacy   # build DB only
     python init_download_db.py --legacy-only   # (re-)run only the legacy import
+    python init_download_db.py --finalize-only # only roll images -> gbif_ids
     python init_download_db.py --reset         # rebuild from scratch
 """
 
@@ -93,6 +96,9 @@ def parse_args():
     p.add_argument("--legacy-only", action="store_true",
                    help="Skip the ingest; only (re-)run the legacy import on an "
                         "existing database (use this to finish an interrupted import)")
+    p.add_argument("--finalize-only", action="store_true",
+                   help="Skip ingest and the disk re-scan; only (re-)roll "
+                        "images.status up into gbif_ids.status on an existing DB")
     p.add_argument("--reset", action="store_true",
                    help="Delete an existing database before building")
     return p.parse_args()
@@ -281,27 +287,61 @@ def import_legacy(conn, processed_file, install_path):
     print(f"    renamed={renamed:,}  already-suffixed={relabeled:,}  "
           f"file-missing={missing:,}")
 
-    # Roll the per-image success flags up into gbif_ids statuses in one pass.
-    print("  Recomputing gbifID statuses ...")
-    conn.execute(
-        "UPDATE gbif_ids SET "
-        "  n_success=(SELECT COUNT(*) FROM images i "
-        "             WHERE i.gbif_id=gbif_ids.gbif_id AND i.status='success'), "
-        "  status=CASE "
-        "    WHEN n_images>0 AND n_images=(SELECT COUNT(*) FROM images i "
-        "         WHERE i.gbif_id=gbif_ids.gbif_id AND i.status='success') "
-        "      THEN 'done' "
-        "    WHEN (SELECT COUNT(*) FROM images i "
-        "         WHERE i.gbif_id=gbif_ids.gbif_id AND i.status='success')>0 "
-        "      THEN 'partial' "
-        "    ELSE 'pending' END "
-        "WHERE gbif_id IN (SELECT DISTINCT gbif_id FROM images "
-        "                  WHERE status='success')"
-    )
+    # Roll the per-image success flags up into gbif_ids statuses.
+    _finalize_gbif_ids_status(conn)
+
+
+def _finalize_gbif_ids_status(conn):
+    """
+    Roll images.status up into gbif_ids.status (done / partial / pending),
+    set n_success, and stamp completed_at on freshly-done IDs.
+
+    Chunked and committed per batch so progress is visible and a kill mid-run
+    is resumable -- a re-run just re-applies the same UPDATEs.
+
+    A previous one-statement UPDATE with three correlated COUNT subqueries
+    and an `IN (SELECT DISTINCT ...)` filter did not finish in 24 h; this
+    Python-side pass takes well under an hour.
+    """
+    print("  Counting success images per gbifID ...")
+    success_counts = conn.execute(
+        "SELECT gbif_id, COUNT(*) FROM images "
+        "WHERE status='success' GROUP BY gbif_id ORDER BY gbif_id"
+    ).fetchall()
+    print(f"    {len(success_counts):,} gbifIDs have at least one success image")
+
+    print("  Loading n_images per gbifID ...")
+    n_images_map = dict(conn.execute(
+        "SELECT gbif_id, n_images FROM gbif_ids"
+    ).fetchall())
+    print(f"    {len(n_images_map):,} gbifIDs total")
+
+    print(f"  Updating gbif_ids statuses ...")
+    BATCH = 50_000
+    updated = 0
+    for start in range(0, len(success_counts), BATCH):
+        chunk = success_counts[start:start + BATCH]
+        rows = []
+        for gid, n_success in chunk:
+            n_total = n_images_map.get(gid, 0)
+            if n_total > 0 and n_success >= n_total:
+                status = "done"
+            elif n_success > 0:
+                status = "partial"
+            else:
+                status = "pending"
+            rows.append((n_success, status, gid))
+        conn.executemany(
+            "UPDATE gbif_ids SET n_success=?, status=? WHERE gbif_id=?", rows)
+        conn.commit()
+        updated += len(rows)
+        progress(f"    {updated:,}/{len(success_counts):,} gbif_ids updated")
+    print(f"    {updated:,} gbif_ids updated        ")
+
+    print("  Setting completed_at for done gbifIDs ...")
     conn.execute(
         "UPDATE gbif_ids SET completed_at=datetime('now') "
-        "WHERE status='done' AND completed_at IS NULL"
-    )
+        "WHERE status='done' AND completed_at IS NULL")
     conn.commit()
 
 
@@ -353,6 +393,21 @@ def main():
         print(f"--legacy-only: (re-)running the legacy import on {args.db}")
         conn = connect(args.db, bulk_load=False)
         import_legacy(conn, args.processed_file, args.install_path)
+        report_status(conn)
+        conn.close()
+        print(f"\nDone in {time.time() - start:.0f}s.")
+        return
+
+    # --finalize-only: just (re-)roll images.status into gbif_ids.status. Use
+    # this to finish a run that was killed during the recompute step.
+    if args.finalize_only:
+        if not os.path.exists(args.db):
+            sys.exit(f"--finalize-only needs an existing database, but none was "
+                     f"found at: {args.db}\nRun the full build first.")
+        print(f"--finalize-only: rolling images.status up into gbif_ids on "
+              f"{args.db}")
+        conn = connect(args.db, bulk_load=False)
+        _finalize_gbif_ids_status(conn)
         report_status(conn)
         conn.close()
         print(f"\nDone in {time.time() - start:.0f}s.")
