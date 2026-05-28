@@ -53,7 +53,10 @@ def main():
     if not os.path.exists(args.db):
         raise SystemExit(f"Status database not found: {args.db}")
 
-    conn = sqlite3.connect(args.db)
+    # Read-only with a generous busy timeout so a brief WAL contention
+    # window from a running downloader can't surface as "disk I/O error".
+    conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True, timeout=60)
+    conn.execute("PRAGMA busy_timeout=60000")
     run_time = datetime.now()
     output_file = os.path.join(
         args.output_dir, f"summary_{run_time:%Y%m%d%H%M}.txt")
