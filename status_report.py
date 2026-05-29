@@ -31,11 +31,38 @@ Usage:
 """
 
 import os
+import time
 import sqlite3
 import argparse
 from datetime import datetime
 
 import download_db as ddb
+
+
+# Transient WAL/checkpoint races on networked filesystems (GPFS) can briefly
+# surface as `disk I/O error` or `file is not a database`. The data is fine;
+# the read is just unlucky. Retry once or twice and the next attempt succeeds.
+_RETRY_DELAYS = (0.5, 2.0)
+
+
+def _q_all(conn, sql, params=()):
+    """Run a SELECT and fetchall() with brief retries on transient I/O errors."""
+    for delay in _RETRY_DELAYS:
+        try:
+            return conn.execute(sql, params).fetchall()
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            time.sleep(delay)
+    return conn.execute(sql, params).fetchall()
+
+
+def _q_one(conn, sql, params=()):
+    """Run a SELECT and fetchone() with brief retries on transient I/O errors."""
+    for delay in _RETRY_DELAYS:
+        try:
+            return conn.execute(sql, params).fetchone()
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            time.sleep(delay)
+    return conn.execute(sql, params).fetchone()
 
 
 def parse_args():
@@ -78,8 +105,8 @@ def main():
 
         # -- gbifID progress --------------------------------------------------
         section("GBIFID PROGRESS")
-        gbif_counts = dict(conn.execute(
-            "SELECT status, COUNT(*) FROM gbif_ids GROUP BY status").fetchall())
+        gbif_counts = dict(_q_all(conn,
+            "SELECT status, COUNT(*) FROM gbif_ids GROUP BY status"))
         total_ids = sum(gbif_counts.values())
         write(f"Total gbifIDs:                  {total_ids:,}")
         for status in (ddb.G_DONE, ddb.G_PARTIAL, ddb.G_PENDING, ddb.G_FAILED):
@@ -91,8 +118,8 @@ def main():
 
         # -- per-image progress ----------------------------------------------
         section("DISTINCT-IMAGE PROGRESS")
-        img_counts = dict(conn.execute(
-            "SELECT status, COUNT(*) FROM images GROUP BY status").fetchall())
+        img_counts = dict(_q_all(conn,
+            "SELECT status, COUNT(*) FROM images GROUP BY status"))
         total_imgs = sum(img_counts.values())
         write(f"Total distinct images:          {total_imgs:,}")
         for status in (ddb.ST_SUCCESS, ddb.ST_PENDING,
@@ -100,9 +127,9 @@ def main():
             count = img_counts.get(status, 0)
             pct = (count / total_imgs * 100) if total_imgs else 0.0
             write(f"  {status:18s}          {count:>14,}  ({pct:5.2f}%)")
-        raw_kept = conn.execute(
+        raw_kept = _q_one(conn,
             "SELECT COUNT(*) FROM images WHERE error_type=?",
-            (ddb.ERR_RAW_UNPROCESSED,)).fetchone()[0]
+            (ddb.ERR_RAW_UNPROCESSED,))[0]
         write(f"  (of 'success', kept raw -- DNG etc., need conversion: "
               f"{raw_kept:,})")
 
@@ -110,10 +137,10 @@ def main():
         section("FAILURES BY TYPE")
         write(f"{'error_type':24s} {'count':>14s}  {'verdict':s}")
         write("-" * 60)
-        rows = conn.execute(
+        rows = _q_all(conn,
             "SELECT error_type, COUNT(*) FROM images "
             "WHERE status LIKE 'failed%' AND error_type IS NOT NULL "
-            "GROUP BY error_type ORDER BY 2 DESC").fetchall()
+            "GROUP BY error_type ORDER BY 2 DESC")
         for error_type, count in rows:
             verdict = "permanent" if ddb.is_permanent(error_type) else "retryable"
             write(f"{error_type:24s} {count:>14,}  {verdict}")
@@ -122,10 +149,9 @@ def main():
 
         # -- retry attempt distribution --------------------------------------
         section("RETRY ATTEMPTS (failed_transient images)")
-        rows = conn.execute(
+        rows = _q_all(conn,
             "SELECT attempts, COUNT(*) FROM images "
-            "WHERE status='failed_transient' GROUP BY attempts ORDER BY attempts"
-        ).fetchall()
+            "WHERE status='failed_transient' GROUP BY attempts ORDER BY attempts")
         for attempts, count in rows:
             note = "  <- retry budget exhausted" if attempts >= ddb.MAX_ATTEMPTS else ""
             write(f"  {attempts} attempt(s): {count:,}{note}")
@@ -137,11 +163,11 @@ def main():
         write("Hosts whose URLs returned an HTML/text page instead of an image")
         write("(e.g. 'direct download no longer supported'). Sample message shown.")
         write("-" * 70)
-        rows = conn.execute(
+        rows = _q_all(conn,
             "SELECT host, COUNT(*) AS n, MIN(error_detail) "
             "FROM images WHERE error_type=? "
             "GROUP BY host ORDER BY n DESC LIMIT 20",
-            (ddb.ERR_INVALID_CONTENT,)).fetchall()
+            (ddb.ERR_INVALID_CONTENT,))
         for host, count, sample in rows:
             write(f"{(host or '?')[:45]:45s} {count:>10,}")
             if sample:
@@ -153,23 +179,23 @@ def main():
         section("TOP 20 HOSTS BY FAILED IMAGES")
         write(f"{'host':40s} {'failed':>10s} {'success':>10s}")
         write("-" * 64)
-        rows = conn.execute(
+        rows = _q_all(conn,
             "SELECT host, "
             "  SUM(CASE WHEN status LIKE 'failed%' THEN 1 ELSE 0 END) AS failed, "
             "  SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS ok "
             "FROM images WHERE host IS NOT NULL AND host != '' "
-            "GROUP BY host ORDER BY failed DESC LIMIT 20").fetchall()
+            "GROUP BY host ORDER BY failed DESC LIMIT 20")
         for host, failed, ok in rows:
             write(f"{host[:40]:40s} {failed or 0:>10,} {ok or 0:>10,}")
 
         # -- circuit-breaker state -------------------------------------------
         section("CIRCUIT BREAKER / COOLDOWNS")
-        broken = conn.execute(
-            "SELECT COUNT(*) FROM hosts WHERE error_count >= 500").fetchone()[0]
-        blocked = conn.execute(
+        broken = _q_one(conn,
+            "SELECT COUNT(*) FROM hosts WHERE error_count >= 500")[0]
+        blocked = _q_one(conn,
             "SELECT COUNT(*) FROM hosts "
             "WHERE blocked_until IS NOT NULL "
-            "AND blocked_until > strftime('%s','now')").fetchone()[0]
+            "AND blocked_until > strftime('%s','now')")[0]
         write(f"Hosts past the circuit-breaker threshold (500 errors): {broken:,}")
         write(f"Hosts currently in cooldown:                          {blocked:,}")
 
