@@ -125,11 +125,15 @@ python status_report.py [--db PATH] [--output-dir DIR]
 Ad hoc queries against the database, e.g.:
 ```sql
 -- count each kind of failure
-SELECT error_type, COUNT(*) FROM images
-WHERE status LIKE 'failed%' GROUP BY error_type ORDER BY 2 DESC;
+SELECT error_type, COUNT(*) FROM images WHERE status LIKE 'failed%' GROUP BY error_type ORDER BY 2 DESC;
 
--- every URL still worth retrying
-SELECT gbif_id, url FROM images WHERE status='failed_transient';
+-- every image still worth retrying (urls is the newline-joined candidate list)
+SELECT gbif_id, urls FROM images WHERE status='failed_transient' LIMIT 50;
+```
+
+Count of how many downloads since a certain date and time.
+```bash
+sqlite3 -readonly /projectnb/herbdl/data/GBIF-F25h/download_status.db "SELECT COUNT(*) FROM images WHERE status='success' AND last_attempt_at > '2026-05-31 20:00:00';"
 ```
 
 ### Image Processing
