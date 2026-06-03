@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 
+# secrets (Slack incoming webhook URL for notifications.py)
+.env
+
 # ignore generated summary files
 summary*.txt
 

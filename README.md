@@ -44,6 +44,8 @@ python image_install_db.py [--db PATH]
 - Failures are classified (404, 401, timeout, rate-limited, dropped connection, …); only transient failures are retried, capped at 4 attempts
 - Retry strategy with backoff for 500-level errors
 
+**Push notifications (optional)**: every 50,000 images downloaded in a run, `image_install_db.py` calls `send_notification(...)` from `notifications.py`, which posts a message to a Slack channel via an incoming webhook. Without `SLACK_WEBHOOK_URL` set, it logs a one-line warning and silently no-ops — the downloader works either way. See the [`notifications.py`](#notificationspy) section below for the one-time setup.
+
 #### `image_install_db.sh`
 **Purpose**: SCC job submission wrapper for `image_install_db.py`.
 
@@ -300,14 +302,29 @@ python link_check.py
 ```
 
 #### `notifications.py`
-**Purpose**: Send push notifications via Pushover API for long-running job monitoring.
+**Purpose**: Post a message to a Slack channel via an incoming webhook, for long-running job monitoring. `image_install_db.py` calls it every 50,000 images successfully downloaded in a run.
 
-**Setup**:
-1. Create a `.env` file with:
-```
-PUSHOVER_API_TOKEN=your_token_here
-PUSHOVER_USER_KEY=your_user_key_here
-```
+**Setup (one-time)**:
+
+1. Open <https://api.slack.com/apps> and click **Create New App** → **From scratch**. Pick the workspace you want notifications in and give the app a name (e.g. *Herbarium downloader*).
+2. In the new app, open **Incoming Webhooks** (left sidebar) and toggle it **On**.
+3. Click **Add New Webhook to Workspace**, pick the channel that should receive the notifications, and authorise.
+4. Copy the resulting webhook URL (looks like `https://hooks.slack.com/services/T…/B…/…`) into a `.env` file in the repo root:
+    ```
+    SLACK_WEBHOOK_URL=https://hooks.slack.com/services/your/webhook/url
+    ```
+    Lock it down so others can't read the URL:
+    ```bash
+    chmod 600 .env
+    ```
+    `.env` is already in `.gitignore`, so the URL won't get committed.
+5. Verify it works:
+    ```bash
+    python -c "from notifications import send_notification; send_notification('Test', 'Slack is working')"
+    ```
+    You should see the message in the channel within a second or two. If you see `SLACK_WEBHOOK_URL not set; skipping notification.` instead, the env var is empty — re-check `.env`.
+
+Without `.env`, notifications are a silent no-op — the downloader runs fine, just without Slack updates. Treat the webhook URL like a secret: anyone with it can post to the channel.
 
 **Function**:
 ```python

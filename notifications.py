@@ -1,25 +1,29 @@
-import requests
-import json
+"""
+Push notifications via a Slack incoming webhook.
+
+The webhook URL is read from `.env` (SLACK_WEBHOOK_URL). Without it
+configured, send_notification() is a silent no-op so the caller (e.g.
+image_install_db.py) keeps working without notifications.
+"""
+
 import os
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
+
 def send_notification(title, message):
-
-    URL = "https://api.pushover.net/1/messages.json"
-
-    api_token = os.getenv("PUSHOVER_API_TOKEN")
-    user_key = os.getenv("PUSHOVER_USER_KEY")
-
-    if not api_token or not user_key:
-        print("Pushover API token or user key not set")
+    url = os.getenv("SLACK_WEBHOOK_URL")
+    if not url:
+        print("SLACK_WEBHOOK_URL not set; skipping notification.")
         return
-
-    data = {
-        "token": os.getenv("PUSHOVER_API_TOKEN"),
-        "user": os.getenv("PUSHOVER_USER_KEY"),
-        "title": title,
-        "message": message
-    }
-    requests.post(URL, data=data)
+    try:
+        requests.post(
+            url,
+            json={"text": f"*{title}*\n{message}"},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        # Never let a notification failure interrupt the caller.
+        print(f"Slack notification failed: {e}")
