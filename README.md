@@ -136,6 +136,30 @@ Count of how many downloads since a certain date and time.
 sqlite3 -readonly /projectnb/herbdl/data/GBIF-F25h/download_status.db "SELECT COUNT(*) FROM images WHERE status='success' AND last_attempt_at > '2026-05-31 20:00:00';"
 ```
 
+#### `db_integrity_check.sh`
+**Purpose**: Run SQLite's `PRAGMA integrity_check` against `download_status.db` and print a fresh row-count snapshot. Use it whenever something looks off — e.g. transient `file is not a database` / `disk I/O error` from concurrent readers, anomalous row counts, or just for periodic verification.
+
+**Best practice — pause the downloader first**. Concurrent WAL writes from `image_install_db.py` on networked filesystems (GPFS) can race with the integrity scan and either slow it down or surface as false positives. The downloader is fully resumable, so stopping it costs nothing.
+
+**Usage**:
+```bash
+# 1. pause the downloader (find its job-ID with `qstat -u $USER`)
+qdel <image_install_db_jobid>
+
+# 2. give SQLite a few seconds to checkpoint the WAL
+sleep 30
+
+# 3. submit the integrity check
+qsub -N db_integrity -l h_rt=4:00:00 -pe omp 4 -P herbdl -j y \
+     -o db_integrity.out db_integrity_check.sh
+
+# 4. when db_integrity.out shows 'ok', restart the downloader
+qsub -N image_install_db -l h_rt=48:00:00 -pe omp 16 -P herbdl \
+     -m beas -M your_email@bu.edu image_install_db.sh
+```
+
+On a clean DB the check prints `ok` (takes ~10–20 minutes on a ~20 GB DB), followed by current row counts for `images`, `gbif_ids`, `hosts`, and a `gbif_ids`-by-status breakdown. Any other output indicates real corruption — capture it from `db_integrity.out`.
+
 ### Image Processing
 
 #### `image_utils.py`
