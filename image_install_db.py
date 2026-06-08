@@ -604,7 +604,7 @@ def process_id(db, gbif_id, total_to_install):
             with counter_lock:
                 n_installed += 1
                 current = n_installed
-            if current % 50000 == 0:
+            if current % 10000 == 0:
                 send_notification(
                     "Image Installation",
                     f"Installed {current} images this run "
