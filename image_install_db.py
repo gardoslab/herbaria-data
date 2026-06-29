@@ -492,6 +492,12 @@ def resolve_and_download(gbif_id, image_no, candidate_urls):
     resolved, manifest_err = [], None
     for url in candidate_urls:
         if is_manifest_url(url):
+            # Respect the circuit breaker / cooldown BEFORE fetching the
+            # manifest -- otherwise a dead IIIF host (e.g. oxalis) is hit
+            # on every manifest even after it has tripped the breaker,
+            # which stalls the whole run on connection timeouts.
+            if is_host_circuit_broken(url) or is_host_blocked(url):
+                continue
             extracted, err = extract_image_from_iiif_manifest(url, gbif_id)
             if extracted:
                 resolved.extend(extracted)
