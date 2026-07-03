@@ -213,6 +213,11 @@ def extract_image_from_iiif_manifest(manifest_url, gbif_id):
     first). On failure image_urls is empty and error_type explains why.
     """
     try:
+        # Manifests are generated on the fly (e.g. oxalis / Meise Botanic
+        # Garden), so they are heavier for the host than a static image.
+        # Throttle these requests a bit more than image downloads to
+        # avoid overwhelming the server and getting connections dropped.
+        time.sleep(random.uniform(0.5, 1.5))
         response = session.get(
             manifest_url,
             headers={"User-Agent": random.choice(user_agents),
