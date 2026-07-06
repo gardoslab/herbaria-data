@@ -65,6 +65,15 @@ def _q_one(conn, sql, params=()):
     return conn.execute(sql, params).fetchone()
 
 
+def _has_column(conn, table, column):
+    """True if `table` has `column` (guards reads of newly-added columns)."""
+    try:
+        rows = _q_all(conn, f"PRAGMA table_info({table})")
+    except sqlite3.DatabaseError:
+        return False
+    return any(row[1] == column for row in rows)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -198,6 +207,33 @@ def main():
             "AND blocked_until > strftime('%s','now')")[0]
         write(f"Hosts past the circuit-breaker threshold (500 errors): {broken:,}")
         write(f"Hosts currently in cooldown:                          {blocked:,}")
+
+        # -- quarantined hosts -----------------------------------------------
+        section("QUARANTINED HOSTS")
+        write("Dead sources whose gbifIDs are pushed to the back of the work")
+        write("queue so working sources download first. 'pending' counts images")
+        write("still awaiting download (pending + retryable transient failures).")
+        write("-" * 70)
+        if not _has_column(conn, "hosts", "quarantined"):
+            write("(quarantine not initialized yet -- run the downloader once to")
+            write(" apply the schema migration)")
+        else:
+            write(f"{'host':45s} {'errors':>10s} {'pending':>10s}")
+            write("-" * 67)
+            q_rows = _q_all(conn,
+                "SELECT host, error_count, quarantined_at FROM hosts "
+                "WHERE quarantined=1 ORDER BY error_count DESC")
+            for host, error_count, quarantined_at in q_rows:
+                pending = _q_one(conn,
+                    "SELECT COUNT(*) FROM images WHERE host=? "
+                    "AND status IN (?, ?)",
+                    (host, ddb.ST_PENDING, ddb.ST_FAILED_TRANSIENT))[0]
+                write(f"{(host or '?')[:45]:45s} {error_count or 0:>10,} "
+                      f"{pending:>10,}")
+                if quarantined_at:
+                    write(f"    quarantined at {quarantined_at}")
+            if not q_rows:
+                write("(none quarantined)")
 
         section("NOTES")
         write("- Counts are over distinct images: a IIIF manifest plus its")
