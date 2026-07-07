@@ -34,6 +34,11 @@ DEFAULT_DB_PATH = "/projectnb/herbdl/data/GBIF-F25h/download_status.db"
 # Retry budget: a transient failure is retried until this many attempts.
 MAX_ATTEMPTS = 4
 
+# A host with at least this many recorded errors is treated as a dead source and
+# quarantined (its gbifIDs are pushed to the back of the work queue). Matches the
+# circuit-breaker threshold in image_install_db.py.
+QUARANTINE_ERROR_THRESHOLD = 500
+
 # ---- images.status -----------------------------------------------------------
 ST_PENDING = "pending"            # never attempted
 ST_SUCCESS = "success"            # image obtained (resized JPEG, or kept raw)
@@ -146,9 +151,11 @@ _TABLES = [
         completed_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS hosts (
-        host          TEXT PRIMARY KEY,
-        error_count   INTEGER NOT NULL DEFAULT 0,
-        blocked_until REAL                  -- epoch seconds; NULL when not blocked
+        host           TEXT PRIMARY KEY,
+        error_count    INTEGER NOT NULL DEFAULT 0,
+        blocked_until  REAL,                 -- epoch seconds; NULL when not blocked
+        quarantined    INTEGER NOT NULL DEFAULT 0,   -- 1 = dead source, deprioritise
+        quarantined_at TEXT                  -- when it was first quarantined
     )""",
 ]
 
@@ -173,10 +180,49 @@ def create_indexes(conn):
     conn.commit()
 
 
+def _table_columns(conn, table):
+    """Return the set of column names on an existing table."""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def migrate_schema(conn):
+    """
+    Bring an existing database up to the current schema without rebuilding it.
+
+    New columns are added with ALTER TABLE ADD COLUMN, guarded by a check
+    against the table's current columns so it is a cheap no-op once applied.
+    This never rewrites or recreates a table -- essential for the ~20 GB
+    production database, where a rebuild would be prohibitively expensive.
+    """
+    host_cols = _table_columns(conn, "hosts")
+    added_quarantined = False
+    if "quarantined" not in host_cols:
+        conn.execute(
+            "ALTER TABLE hosts ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0")
+        added_quarantined = True
+    if "quarantined_at" not in host_cols:
+        conn.execute("ALTER TABLE hosts ADD COLUMN quarantined_at TEXT")
+
+    # One-time backfill, run only when the column is first added: hosts already
+    # past the error threshold (e.g. a dead IIIF manifest host that accrued its
+    # failures before this feature existed) are quarantined immediately, so
+    # their gbifIDs are deprioritised on the very next run instead of only after
+    # they re-cross the threshold. Gated on the just-added column so a later
+    # re-run never re-quarantines a host that was deliberately cleared.
+    if added_quarantined:
+        conn.execute(
+            "UPDATE hosts SET quarantined=1, quarantined_at=datetime('now') "
+            "WHERE error_count >= ? AND quarantined=0",
+            (QUARANTINE_ERROR_THRESHOLD,),
+        )
+    conn.commit()
+
+
 def apply_schema(conn):
-    """Create tables and indexes if they do not already exist."""
+    """Create tables and indexes if they do not already exist, then migrate."""
     create_tables(conn)
     create_indexes(conn)
+    migrate_schema(conn)
 
 
 # ---- runtime handle ----------------------------------------------------------
@@ -209,11 +255,39 @@ class DownloadDB:
     # -- work queue ------------------------------------------------------------
 
     def get_work_gbif_ids(self):
-        """Return every gbifID that still has work to do, in ascending order."""
+        """
+        Return every gbifID that still has work to do.
+
+        Working sources come first: a gbifID whose distinct images ALL live on
+        quarantined hosts is pushed to the back of the queue, so a dead source
+        (e.g. an unreachable IIIF manifest host with millions of queued images)
+        no longer starves the run of the gbifIDs it could actually download.
+        Ordering is by gbif_id within each group. When nothing is quarantined
+        this is the original ascending-gbif_id query.
+        """
+        quarantined = self.quarantined_host_set()
         with self.lock:
+            if not quarantined:
+                cur = self.conn.execute(
+                    "SELECT gbif_id FROM gbif_ids WHERE status IN (?, ?) "
+                    "ORDER BY gbif_id",
+                    (G_PENDING, G_PARTIAL),
+                )
+                return [row[0] for row in cur.fetchall()]
+
+            # has_working = the gbifID has at least one image on a non-quarantined
+            # (or unknown) host, i.e. something worth trying first. All-quarantined
+            # gbifIDs (has_working = 0) sort last.
+            placeholders = ",".join("?" * len(quarantined))
             cur = self.conn.execute(
-                "SELECT gbif_id FROM gbif_ids WHERE status IN (?, ?) ORDER BY gbif_id",
-                (G_PENDING, G_PARTIAL),
+                "SELECT g.gbif_id, "
+                "  MAX(CASE WHEN i.host IS NULL OR i.host = '' "
+                "           OR i.host NOT IN (%s) THEN 1 ELSE 0 END) AS has_working "
+                "FROM gbif_ids g JOIN images i ON i.gbif_id = g.gbif_id "
+                "WHERE g.status IN (?, ?) "
+                "GROUP BY g.gbif_id "
+                "ORDER BY has_working DESC, g.gbif_id" % placeholders,
+                (*quarantined, G_PENDING, G_PARTIAL),
             )
             return [row[0] for row in cur.fetchall()]
 
@@ -319,6 +393,44 @@ class DownloadDB:
                 rows,
             )
             self.conn.commit()
+
+    # -- host quarantine -------------------------------------------------------
+
+    def mark_host_quarantined(self, host, error_count=None):
+        """
+        Flag a host as a dead source so its gbifIDs are deprioritised on future
+        runs (see get_work_gbif_ids).
+
+        Upserts the hosts row -- the host may not have been persisted yet when it
+        crosses the threshold. Idempotent: re-marking keeps the original
+        quarantined_at and only raises the recorded error_count.
+        """
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO hosts(host, error_count, quarantined, quarantined_at) "
+                "VALUES(?, ?, 1, datetime('now')) "
+                "ON CONFLICT(host) DO UPDATE SET "
+                "  quarantined=1, "
+                "  quarantined_at=COALESCE(quarantined_at, datetime('now')), "
+                "  error_count=MAX(error_count, excluded.error_count)",
+                (host, error_count or 0),
+            )
+            self.conn.commit()
+
+    def get_quarantined_hosts(self):
+        """Return [(host, error_count, quarantined_at)] for quarantined hosts."""
+        with self.lock:
+            return self.conn.execute(
+                "SELECT host, error_count, quarantined_at FROM hosts "
+                "WHERE quarantined=1 ORDER BY error_count DESC"
+            ).fetchall()
+
+    def quarantined_host_set(self):
+        """Return the set of currently-quarantined host names."""
+        with self.lock:
+            return {row[0] for row in self.conn.execute(
+                "SELECT host FROM hosts WHERE quarantined=1"
+            ).fetchall()}
 
     # -- reporting helpers -----------------------------------------------------
 

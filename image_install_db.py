@@ -72,6 +72,12 @@ MIN_IMAGE_MB = 0.01          # files smaller than this are treated as invalid
 HOST_COOLDOWN_DEFAULT = 30 * 60
 HOST_COOLDOWN_TIMEOUT = 60 * 60
 HOST_ERROR_THRESHOLD = 500   # circuit breaker: skip a host after this many errors
+# A host that trips the circuit breaker is also persistently quarantined, so its
+# gbifIDs are pushed to the back of the work queue on later runs and working
+# sources download first (see download_db.get_work_gbif_ids). Shared with the
+# migration backfill in download_db.py so the two cannot drift apart.
+QUARANTINE_THRESHOLD = ddb.QUARANTINE_ERROR_THRESHOLD
+assert QUARANTINE_THRESHOLD == HOST_ERROR_THRESHOLD
 
 # Extensions under which an undecodable-but-real image is kept for later.
 RAW_EXTS = (".dng", ".nef", ".cr2", ".cr3", ".arw", ".raf", ".orf", ".rw2",
@@ -84,6 +90,10 @@ host_error_counts = {}
 host_lock = threading.Lock()
 circuit_breaker_lock = threading.Lock()
 counter_lock = threading.Lock()
+
+# DownloadDB handle, set in main(). increment_host_errors() uses it to persist a
+# quarantine flag when a host trips the threshold; None outside a real run.
+quarantine_db = None
 
 n_installed = 0
 
@@ -176,6 +186,19 @@ def increment_host_errors(url, is_rate_limit=False):
             logger.error(f"CIRCUIT BREAKER: host '{host}' reached "
                          f"{HOST_ERROR_THRESHOLD} errors; skipping it from now on.")
 
+    # Persistently quarantine a host once it crosses the threshold, so its
+    # gbifIDs are pushed to the back of the work queue on later runs. Marked
+    # exactly once (only the thread that reaches the threshold sees count ==
+    # QUARANTINE_THRESHOLD), and done outside circuit_breaker_lock so the DB
+    # write does not block other workers' error accounting.
+    if count == QUARANTINE_THRESHOLD and quarantine_db is not None:
+        try:
+            quarantine_db.mark_host_quarantined(host, error_count=count)
+            logger.error(f"QUARANTINED host '{host}' after {count} errors; its "
+                         f"gbifIDs will be deprioritised on future runs.")
+        except Exception as e:
+            logger.error(f"Failed to quarantine host '{host}': {e}")
+
 
 def block_host(url, retry_after=None, timeout_issue=False):
     host = _host_from_url(url)
@@ -226,6 +249,15 @@ def extract_image_from_iiif_manifest(manifest_url, gbif_id):
         )
         if response.status_code != 200:
             logger.warning(f"IIIF manifest {gbif_id}: HTTP {response.status_code}")
+            # Count the failure against the host so a manifest host that fails
+            # everything (e.g. oxalis) eventually trips the breaker / quarantine
+            # -- previously only download_one_url incremented, so manifest hosts
+            # never got there. 429 is a cooldown, not a permanent-breaker error.
+            if response.status_code == 429:
+                increment_host_errors(manifest_url, is_rate_limit=True)
+                block_host(manifest_url, response.headers.get("Retry-After"))
+            else:
+                increment_host_errors(manifest_url)
             return [], ddb.http_error_type(response.status_code)
 
         manifest = response.json()
@@ -250,14 +282,20 @@ def extract_image_from_iiif_manifest(manifest_url, gbif_id):
                             image_urls.append(f"{base_url}/full/800,/0/default.jpg")
 
         if not image_urls:
+            increment_host_errors(manifest_url)
             return [], ddb.ERR_MANIFEST
         return image_urls, None
 
     except (ConnectTimeout, ReadTimeout, Timeout) as e:
         logger.warning(f"IIIF manifest {gbif_id}: timeout {e}")
+        increment_host_errors(manifest_url)
+        block_host(manifest_url, timeout_issue=True)
         return [], ddb.ERR_TIMEOUT
     except Exception as e:
+        # A dropped connection under load (oxalis) lands here as well as a real
+        # parse error; both count against the host.
         logger.warning(f"IIIF manifest {gbif_id}: parse error {e}")
+        increment_host_errors(manifest_url)
         return [], ddb.ERR_MANIFEST
 
 
@@ -659,6 +697,10 @@ def main():
             f"Build it once first:  python init_download_db.py")
 
     db = DownloadDB(args.db)
+
+    # Let increment_host_errors() persist quarantine flags on this run's DB.
+    global quarantine_db
+    quarantine_db = db
 
     # Seed the in-memory circuit breaker from the last run's host stats.
     saved_errors, saved_blocks = db.load_host_state()
