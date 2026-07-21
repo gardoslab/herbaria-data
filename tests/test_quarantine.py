@@ -108,6 +108,45 @@ class QuarantineSchemaTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_backfill_respects_failure_rate(self):
+        thr = ddb.QUARANTINE_ERROR_THRESHOLD
+        # Old (pre-quarantine) schema: hosts with error counts, plus an images
+        # table so the failure-rate backfill can count per-host successes.
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "CREATE TABLE hosts (host TEXT PRIMARY KEY, "
+            "error_count INTEGER NOT NULL DEFAULT 0, blocked_until REAL)")
+        conn.executemany(
+            "INSERT INTO hosts(host, error_count) VALUES(?, ?)",
+            [("nmnh.example", thr), ("oxalis.example", thr)])
+        # Real images schema so create_indexes (which indexes error_type/host/
+        # status) succeeds when DownloadDB opens this old-schema DB.
+        conn.execute(
+            "CREATE TABLE images (gbif_id INTEGER NOT NULL, "
+            "image_no INTEGER NOT NULL, image_key TEXT NOT NULL, "
+            "urls TEXT NOT NULL, host TEXT, "
+            "status TEXT NOT NULL DEFAULT 'pending', http_status INTEGER, "
+            "error_type TEXT, error_detail TEXT, file_path TEXT, "
+            "file_size INTEGER, attempts INTEGER NOT NULL DEFAULT 0, "
+            "last_attempt_at TEXT, PRIMARY KEY (gbif_id, image_no))")
+        # nmnh: thr errors but overwhelmingly successful -> healthy, keep it.
+        # (1000 successes vs 500 errors = 0.33 rate, well under the threshold.)
+        conn.executemany(
+            "INSERT INTO images(gbif_id, image_no, image_key, urls, host, status) "
+            "VALUES(?,?,?,?,?,?)",
+            [(i, 0, f"k{i}", "u", "nmnh.example", ddb.ST_SUCCESS)
+             for i in range(1000)])
+        # oxalis: thr errors, zero successes -> dead source, quarantine it.
+        conn.commit()
+        conn.close()
+
+        # Opening with DownloadDB runs the one-time failure-rate backfill.
+        db = DownloadDB(self.path)
+        try:
+            self.assertEqual(db.quarantined_host_set(), {"oxalis.example"})
+        finally:
+            db.close()
+
     def test_backfill_runs_once_and_does_not_requarantine(self):
         thr = ddb.QUARANTINE_ERROR_THRESHOLD
         self._old_hosts_db([("dead.example", thr + 100)])
@@ -179,6 +218,26 @@ class QuarantineHelpersTest(unittest.TestCase):
         self.db.save_host_state({"dead.example": 300}, {})
         self.db.mark_host_quarantined("dead.example", error_count=500)
         self.assertEqual(self.db.quarantined_host_set(), {"dead.example"})
+
+    def _add_success_images(self, host, n):
+        """Record `n` succeeded images for `host` (its n_success signal)."""
+        with self.db.lock:
+            self.db.conn.executemany(
+                "INSERT INTO images(gbif_id, image_no, image_key, urls, host, "
+                "status) VALUES(?,?,?,?,?,?)",
+                [(i, 0, f"k{i}", "u", host, ddb.ST_SUCCESS) for i in range(n)])
+            self.db.conn.commit()
+
+    def test_quarantine_if_unhealthy_by_failure_rate(self):
+        thr = ddb.QUARANTINE_ERROR_THRESHOLD
+        # Healthy source: thr errors but far more successes -> spared (False).
+        self._add_success_images("nmnh.example", 1000)
+        self.assertFalse(self.db.quarantine_if_unhealthy("nmnh.example", thr))
+        self.assertNotIn("nmnh.example", self.db.quarantined_host_set())
+
+        # Pure-failure source: thr errors, zero successes -> quarantined (True).
+        self.assertTrue(self.db.quarantine_if_unhealthy("oxalis.example", thr))
+        self.assertIn("oxalis.example", self.db.quarantined_host_set())
 
 
 class WorkQueueOrderingTest(unittest.TestCase):

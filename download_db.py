@@ -26,18 +26,29 @@ A gbifID is 'done' only when every one of its distinct images has succeeded.
 import os
 import re
 import time
+import logging
 import sqlite3
 import threading
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "/projectnb/herbdl/data/GBIF-F25h/download_status.db"
 
 # Retry budget: a transient failure is retried until this many attempts.
 MAX_ATTEMPTS = 4
 
-# A host with at least this many recorded errors is treated as a dead source and
-# quarantined (its gbifIDs are pushed to the back of the work queue). Matches the
-# circuit-breaker threshold in image_install_db.py.
+# A host must have at least this many recorded errors before it can be
+# quarantined at all (its gbifIDs are pushed to the back of the work queue).
+# Matches the circuit-breaker threshold in image_install_db.py. This alone is
+# NOT enough: a huge source (e.g. nmnh, 1.94M successes) can accrue 500 errors
+# while still being overwhelmingly healthy, so quarantine also requires the
+# failure RATE below to be exceeded -- see quarantine_if_unhealthy / the backfill.
 QUARANTINE_ERROR_THRESHOLD = 500
+
+# Fraction of a host's attempts that must be failures before it is quarantined.
+# A host with rate <= this is left alone even past QUARANTINE_ERROR_THRESHOLD.
+# Tom wants 10% -> set this to 0.1.
+QUARANTINE_FAILURE_RATE = 0.5
 
 # ---- images.status -----------------------------------------------------------
 ST_PENDING = "pending"            # never attempted
@@ -203,17 +214,29 @@ def migrate_schema(conn):
     if "quarantined_at" not in host_cols:
         conn.execute("ALTER TABLE hosts ADD COLUMN quarantined_at TEXT")
 
-    # One-time backfill, run only when the column is first added: hosts already
-    # past the error threshold (e.g. a dead IIIF manifest host that accrued its
-    # failures before this feature existed) are quarantined immediately, so
-    # their gbifIDs are deprioritised on the very next run instead of only after
-    # they re-cross the threshold. Gated on the just-added column so a later
-    # re-run never re-quarantines a host that was deliberately cleared.
+    # One-time backfill, run only when the column is first added: hosts that are
+    # genuinely dead sources (e.g. a IIIF manifest host that accrued its failures
+    # before this feature existed) are quarantined immediately, so their gbifIDs
+    # are deprioritised on the very next run instead of only after they re-cross
+    # the threshold. Gated on the just-added column so a later re-run never
+    # re-quarantines a host that was deliberately cleared.
+    #
+    # A host qualifies only if it is BOTH past the absolute error floor AND its
+    # failure rate exceeds QUARANTINE_FAILURE_RATE. n_success is counted from the
+    # images table per host; * 1.0 forces float division (integer division would
+    # collapse every rate to 0 or 1). This spares big-but-healthy sources (nmnh:
+    # 500 errors against 1.94M successes) while still catching dead ones (oxalis:
+    # 500 errors, 0 successes).
     if added_quarantined:
         conn.execute(
             "UPDATE hosts SET quarantined=1, quarantined_at=datetime('now') "
-            "WHERE error_count >= ? AND quarantined=0",
-            (QUARANTINE_ERROR_THRESHOLD,),
+            "WHERE error_count >= ? "
+            "  AND error_count * 1.0 / (error_count + ("
+            "        SELECT COUNT(*) FROM images "
+            "        WHERE images.host = hosts.host AND images.status = ?"
+            "      )) > ? "
+            "  AND quarantined=0",
+            (QUARANTINE_ERROR_THRESHOLD, ST_SUCCESS, QUARANTINE_FAILURE_RATE),
         )
     conn.commit()
 
@@ -416,6 +439,36 @@ class DownloadDB:
                 (host, error_count or 0),
             )
             self.conn.commit()
+
+    def quarantine_if_unhealthy(self, host, error_count):
+        """
+        Quarantine `host` only if its failure RATE is bad, not merely its raw
+        error count. A big source can cross QUARANTINE_ERROR_THRESHOLD while
+        still being overwhelmingly successful (nmnh: 500 errors, 1.94M
+        successes); quarantining it would wrongly deprioritise a healthy source.
+
+        n_success is the host's succeeded-image count. rate <= the shared
+        QUARANTINE_FAILURE_RATE means healthy -> log and return False without
+        touching the row. Otherwise defer to mark_host_quarantined (whose
+        semantics are unchanged) and return True.
+        """
+        with self.lock:
+            n_success = self.conn.execute(
+                "SELECT COUNT(*) FROM images WHERE host=? AND status=?",
+                (host, ST_SUCCESS),
+            ).fetchone()[0]
+        total = error_count + n_success
+        rate = error_count / total if total else 0.0
+        if rate <= QUARANTINE_FAILURE_RATE:
+            logger.info(
+                "host '%s' healthy, not quarantining (%d errors / %d success = "
+                "%.3f rate <= %.3f)",
+                host, error_count, n_success, rate, QUARANTINE_FAILURE_RATE)
+            return False
+        # mark_host_quarantined acquires self.lock itself, so it must be called
+        # without the lock held (threading.Lock is not reentrant).
+        self.mark_host_quarantined(host, error_count=error_count)
+        return True
 
     def get_quarantined_hosts(self):
         """Return [(host, error_count, quarantined_at)] for quarantined hosts."""
