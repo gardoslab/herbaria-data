@@ -191,11 +191,15 @@ def increment_host_errors(url, is_rate_limit=False):
     # exactly once (only the thread that reaches the threshold sees count ==
     # QUARANTINE_THRESHOLD), and done outside circuit_breaker_lock so the DB
     # write does not block other workers' error accounting.
+    #
+    # quarantine_if_unhealthy checks the failure RATE, not just the raw count, so
+    # a big-but-healthy source (nmnh) is spared while a dead one (oxalis) is
+    # caught. Only log QUARANTINED when it actually quarantined the host.
     if count == QUARANTINE_THRESHOLD and quarantine_db is not None:
         try:
-            quarantine_db.mark_host_quarantined(host, error_count=count)
-            logger.error(f"QUARANTINED host '{host}' after {count} errors; its "
-                         f"gbifIDs will be deprioritised on future runs.")
+            if quarantine_db.quarantine_if_unhealthy(host, error_count=count):
+                logger.error(f"QUARANTINED host '{host}' after {count} errors; its "
+                             f"gbifIDs will be deprioritised on future runs.")
         except Exception as e:
             logger.error(f"Failed to quarantine host '{host}': {e}")
 
