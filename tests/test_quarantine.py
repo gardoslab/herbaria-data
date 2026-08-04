@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import download_db as ddb
 from download_db import DownloadDB
+import image_install_db as iidb
 
 
 class QuarantineSchemaTest(unittest.TestCase):
@@ -296,6 +297,41 @@ class WorkQueueOrderingTest(unittest.TestCase):
         self.assertEqual(work, [100, 200, 400, 300])
         self.assertEqual(work[-1], 300)
         self.assertLess(work.index(200), work.index(300))  # mixed beats all-dead
+
+
+class CircuitBreakerRateTest(unittest.TestCase):
+    """
+    The in-memory breaker in image_install_db judges a host by failure RATE, not
+    raw error count -- so a released-but-still-error-carrying host is not skipped.
+    """
+
+    HOST = "host.example"
+    URL = "https://host.example/img.jpg"
+
+    def setUp(self):
+        # is_host_circuit_broken reads module-level dicts; isolate each test.
+        iidb.host_error_counts.clear()
+        iidb.host_success_counts.clear()
+
+    def tearDown(self):
+        iidb.host_error_counts.clear()
+        iidb.host_success_counts.clear()
+
+    def test_healthy_big_source_not_broken(self):
+        # 500 errors against 2M successes -> ~0.00025 rate -> healthy.
+        iidb.host_error_counts[self.HOST] = iidb.HOST_ERROR_THRESHOLD
+        iidb.host_success_counts[self.HOST] = 2_000_000
+        self.assertFalse(iidb.is_host_circuit_broken(self.URL))
+
+    def test_dead_source_at_threshold_is_broken(self):
+        # 500 errors, zero successes -> rate 1.0 -> broken.
+        iidb.host_error_counts[self.HOST] = iidb.HOST_ERROR_THRESHOLD
+        self.assertTrue(iidb.is_host_circuit_broken(self.URL))
+
+    def test_below_minimum_sample_not_broken(self):
+        # 400 errors, zero successes: bad rate but under the sample floor -> spared.
+        iidb.host_error_counts[self.HOST] = iidb.HOST_ERROR_THRESHOLD - 100
+        self.assertFalse(iidb.is_host_circuit_broken(self.URL))
 
 
 if __name__ == "__main__":

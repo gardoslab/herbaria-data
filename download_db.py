@@ -387,19 +387,33 @@ class DownloadDB:
     # -- host circuit-breaker state -------------------------------------------
 
     def load_host_state(self):
-        """Return (error_counts, blocked_until) dicts to seed the in-memory state."""
+        """
+        Return (error_counts, success_counts, blocked_until) dicts to seed the
+        in-memory circuit breaker.
+
+        success_counts comes from a correlated subquery over the images table
+        (there is no hosts.n_success column) so the breaker can judge a host by
+        its failure RATE, not just its raw error count -- a big-but-healthy
+        source (nmnh: 500 errors, ~2M successes) must not be skipped.
+        """
         now = time.time()
         with self.lock:
             cur = self.conn.execute(
-                "SELECT host, error_count, blocked_until FROM hosts"
+                "SELECT host, error_count, blocked_until, "
+                "  (SELECT COUNT(*) FROM images "
+                "   WHERE images.host = hosts.host AND images.status = ?) "
+                "FROM hosts",
+                (ST_SUCCESS,),
             )
-            error_counts, blocked_until = {}, {}
-            for host, count, until in cur.fetchall():
+            error_counts, success_counts, blocked_until = {}, {}, {}
+            for host, count, until, n_success in cur.fetchall():
                 if count:
                     error_counts[host] = count
+                if n_success:
+                    success_counts[host] = n_success
                 if until and until > now:
                     blocked_until[host] = until
-            return error_counts, blocked_until
+            return error_counts, success_counts, blocked_until
 
     def save_host_state(self, error_counts, blocked_until):
         """Persist the in-memory circuit-breaker dicts so they survive a restart."""
