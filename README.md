@@ -1,13 +1,61 @@
-# Utils Directory
+# GBIF Image Data Download
 
 This directory contains utility scripts for managing herbarium specimen images, including downloading, processing, organizing, and labeling datasets.
+
+> **Deploying the image downloader?** See [DEPLOYMENT.md](DEPLOYMENT.md) for the
+> step-by-step procedure (build the status database once, then run/resume the
+> download job).
 
 ## Scripts Overview
 
 ### Image Download & Installation
 
-#### `image_install_parallel.py`
-**Purpose**: Primary script for downloading herbarium specimen images from GBIF (Global Biodiversity Information Facility) multimedia datasets.
+#### `image_install_db.py`
+**Purpose**: Current script for downloading herbarium specimen images from GBIF (Global Biodiversity Information Facility) multimedia datasets. Downloads one file per **distinct image** of each gbifID, saved as `<gbifID>-NN.jpg`, with status tracked in a SQLite database. See [DEPLOYMENT.md](DEPLOYMENT.md) for the full procedure.
+
+**Key Features**:
+- Parallel downloading with ThreadPoolExecutor (5 workers)
+- Host-based rate limiting and circuit breaker pattern
+- IIIF manifest support, with deduplication — a manifest plus the resolution variants of one specimen photo count as **one** image, so one file is saved, not three
+- Automatic image resizing to 1024px max-dimension JPEG
+- TIFF/PNG decoded and saved as JPEG; camera-raw **DNG kept as-is** (`<gbifID>-NN.dng`, flagged `raw_unprocessed`) rather than discarded
+- HTML/text responses (e.g. "direct download no longer supported") detected and the page text captured for follow-up
+- Atomic downloads (stream to `.tmp`, length-check, then rename) so a dropped connection never leaves a corrupt file
+- SQLite status database for resumable downloads and queryable, classified error tracking — see [`download_db.py`](download_db.py)
+- Hierarchical directory organization (3-digit prefix structure)
+
+**Prerequisite**: build the status database once with `python init_download_db.py` before the first run.
+
+**Usage**:
+```bash
+python image_install_db.py [--db PATH]
+```
+
+**Configuration**:
+- Input: `/projectnb/herbdl/data/GBIF-F25/multimedia.txt` (ingested once into the database)
+- Output: `/projectnb/herbdl/data/GBIF-F25h/`
+- Logs: `/projectnb/herbdl/logs/image_install_*.log` (WARNING level and above only — routine successes are recorded in the database, not the log)
+- Status: `download_status.db` (default `/projectnb/herbdl/data/GBIF-F25h/download_status.db`)
+
+**Advanced Features**:
+- Host cooldown on rate limiting (429 errors): 30 minutes default
+- Host cooldown on timeouts: 60 minutes
+- Circuit breaker: skips hosts after 500+ errors; state persists across runs in the `hosts` table
+- Failures are classified (404, 401, timeout, rate-limited, dropped connection, …); only transient failures are retried, capped at 4 attempts
+- Retry strategy with backoff for 500-level errors
+
+**Push notifications (optional)**: every 50,000 images downloaded in a run, `image_install_db.py` calls `send_notification(...)` from `notifications.py`, which posts a message to a Slack channel via an incoming webhook. Without `SLACK_WEBHOOK_URL` set, it logs a one-line warning and silently no-ops — the downloader works either way. See the [`notifications.py`](#notificationspy) section below for the one-time setup.
+
+#### `image_install_db.sh`
+**Purpose**: SCC job submission wrapper for `image_install_db.py`.
+
+**Usage**:
+```bash
+qsub -N image_install_db -l h_rt=48:00:00 -pe omp 16 -P herbdl -m beas -M your_email@bu.edu image_install_db.sh
+```
+
+#### `image_install_parallel.py` (original)
+**Purpose**: The original downloader, kept for reference and fallback — superseded by `image_install_db.py`. Downloads **one** image per gbifID (stops at the first URL that succeeds) and tracks progress in flat `processed_ids.txt` / `failed_ids.txt` files.
 
 **Key Features**:
 - Parallel downloading with ThreadPoolExecutor (5 workers)
@@ -30,20 +78,89 @@ python image_install_parallel.py [-c COUNTRY_CODE]
 - Logs: `/projectnb/herbdl/logs/image_install_*.log`
 - Checkpoints: `processed_ids.txt`, `failed_ids.txt`
 
-**Advanced Features**:
-- Host cooldown on rate limiting (429 errors): 30 minutes default
-- Host cooldown on timeouts: 60 minutes
-- Circuit breaker: Permanently blocks hosts after 50+ errors
-- Multiple URL fallback per GBIF ID
-- Retry strategy with backoff for 500-level errors
-
 #### `image_install.sh`
-**Purpose**: SCC job submission wrapper for `image_install_parallel.py`.
+**Purpose**: SCC job submission wrapper for the original `image_install_parallel.py`.
 
 **Usage**:
 ```bash
 qsub -N image_install -l h_rt=48:00:00 -pe omp 16 -P herbdl -m beas -M your_email@bu.edu image_install.sh
 ```
+
+#### `download_db.py`
+**Purpose**: SQLite-backed download-status tracking. Imported by the other download scripts — not run directly.
+
+**Why it exists**: replaces the flat `processed_ids.txt` / `failed_ids.txt` files, which recorded only an ID with no reason for failure. The database records, per distinct image, whether it succeeded or failed and *why*, so failures are queryable and only transient ones get retried.
+
+**Tables**:
+- `images` — one row per **distinct image** (the download unit): `image_no`, `image_key` (canonical identity), `urls` (candidate URLs), `status`, `http_status`, `error_type`, `error_detail`, `file_path`, `file_size`, `attempts`
+- `gbif_ids` — one row per gbifID; the resumable work queue (`pending` / `partial` / `done` / `failed`); `n_images` is the distinct-image count
+- `hosts` — per-host error tally and cooldown, so circuit-breaker state survives a restart
+
+`canonical_image_key()` collapses a IIIF manifest and the resolution variants of one specimen photo to a single key, so multiple `multimedia.txt` rows become one `images` row.
+
+#### `init_download_db.py`
+**Purpose**: One-time builder for the status database.
+
+**What it does**:
+1. Creates the schema
+2. Reads `multimedia.txt` once, groups its rows into **distinct images** (a manifest + resolution variants of one photo collapse to one), and loads `images` + `gbif_ids` — so later runs never re-read the 59M-row file
+3. Imports `processed_ids.txt`: renames legacy `<id>.jpg` files to `<id>-00.jpg` for a consistent naming scheme and marks image 0 done. Multi-image gbifIDs are left `partial` so the downloader fetches their remaining images. (`failed_ids.txt` is **not** imported — those IDs get a fresh, tracked retry.)
+
+**Usage**:
+```bash
+python init_download_db.py                 # build DB + import legacy progress
+python init_download_db.py --skip-legacy   # build DB only
+python init_download_db.py --legacy-only   # (re-)run only the legacy import
+python init_download_db.py --reset         # rebuild from scratch
+```
+
+#### `status_report.py`
+**Purpose**: Report download progress directly from the database — replaces `analyze_image_progress.py`. Every figure is a single indexed SQL query, so it returns in seconds instead of loading ~180 MB of text and re-grouping `multimedia.txt`.
+
+**Reports**: gbifID and per-image progress, failures broken down by type (permanent vs retryable), retry-attempt distribution, worst hosts, and circuit-breaker state. Writes a timestamped `summary_YYYYMMDDHHMM.txt`.
+
+**Usage**:
+```bash
+python status_report.py [--db PATH] [--output-dir DIR]
+```
+
+Ad hoc queries against the database, e.g.:
+```sql
+-- count each kind of failure
+SELECT error_type, COUNT(*) FROM images WHERE status LIKE 'failed%' GROUP BY error_type ORDER BY 2 DESC;
+
+-- every image still worth retrying (urls is the newline-joined candidate list)
+SELECT gbif_id, urls FROM images WHERE status='failed_transient' LIMIT 50;
+```
+
+Count of how many downloads since a certain date and time.
+```bash
+sqlite3 -readonly /projectnb/herbdl/data/GBIF-F25h/download_status.db "SELECT COUNT(*) FROM images WHERE status='success' AND last_attempt_at > '2026-05-31 20:00:00';"
+```
+
+#### `db_integrity_check.sh`
+**Purpose**: Run SQLite's `PRAGMA integrity_check` against `download_status.db` and print a fresh row-count snapshot. Use it whenever something looks off — e.g. transient `file is not a database` / `disk I/O error` from concurrent readers, anomalous row counts, or just for periodic verification.
+
+**Best practice — pause the downloader first**. Concurrent WAL writes from `image_install_db.py` on networked filesystems (GPFS) can race with the integrity scan and either slow it down or surface as false positives. The downloader is fully resumable, so stopping it costs nothing.
+
+**Usage**:
+```bash
+# 1. pause the downloader (find its job-ID with `qstat -u $USER`)
+qdel <image_install_db_jobid>
+
+# 2. give SQLite a few seconds to checkpoint the WAL
+sleep 30
+
+# 3. submit the integrity check
+qsub -N db_integrity -l h_rt=4:00:00 -pe omp 4 -P herbdl -j y \
+     -o db_integrity.out db_integrity_check.sh
+
+# 4. when db_integrity.out shows 'ok', restart the downloader
+qsub -N image_install_db -l h_rt=48:00:00 -pe omp 16 -P herbdl \
+     -m beas -M your_email@bu.edu image_install_db.sh
+```
+
+On a clean DB the check prints `ok` (takes ~10–20 minutes on a ~20 GB DB), followed by current row counts for `images`, `gbif_ids`, `hosts`, and a `gbif_ids`-by-status breakdown. Any other output indicates real corruption — capture it from `db_integrity.out`.
 
 ### Image Processing
 
@@ -185,14 +302,29 @@ python link_check.py
 ```
 
 #### `notifications.py`
-**Purpose**: Send push notifications via Pushover API for long-running job monitoring.
+**Purpose**: Post a message to a Slack channel via an incoming webhook, for long-running job monitoring. `image_install_db.py` calls it every 50,000 images successfully downloaded in a run.
 
-**Setup**:
-1. Create a `.env` file with:
-```
-PUSHOVER_API_TOKEN=your_token_here
-PUSHOVER_USER_KEY=your_user_key_here
-```
+**Setup (one-time)**:
+
+1. Open <https://api.slack.com/apps> and click **Create New App** → **From scratch**. Pick the workspace you want notifications in and give the app a name (e.g. *Herbarium downloader*).
+2. In the new app, open **Incoming Webhooks** (left sidebar) and toggle it **On**.
+3. Click **Add New Webhook to Workspace**, pick the channel that should receive the notifications, and authorise.
+4. Copy the resulting webhook URL (looks like `https://hooks.slack.com/services/T…/B…/…`) into a `.env` file in the repo root:
+    ```
+    SLACK_WEBHOOK_URL=https://hooks.slack.com/services/your/webhook/url
+    ```
+    Lock it down so others can't read the URL:
+    ```bash
+    chmod 600 .env
+    ```
+    `.env` is already in `.gitignore`, so the URL won't get committed.
+5. Verify it works:
+    ```bash
+    python -c "from notifications import send_notification; send_notification('Test', 'Slack is working')"
+    ```
+    You should see the message in the channel within a second or two. If you see `SLACK_WEBHOOK_URL not set; skipping notification.` instead, the env var is empty — re-check `.env`.
+
+Without `.env`, notifications are a silent no-op — the downloader runs fine, just without Slack updates. Treat the webhook URL like a secret: anyone with it can post to the channel.
 
 **Function**:
 ```python
@@ -205,17 +337,24 @@ from notifications import send_notification
 send_notification("Image Installation", "Downloaded 50,000 images")
 ```
 
-**Integration**: Used by `image_install_parallel.py` to send progress updates every 50,000 images.
+**Integration**: Used by the image download scripts (`image_install_db.py` and `image_install_parallel.py`) to send progress updates every 50,000 images.
 
 ## Common Workflows
 
 ### 1. Download GBIF Images
-```bash
-# Submit parallel download job
-qsub -N image_install -l h_rt=48:00:00 -pe omp 16 -P herbdl image_install.sh
 
-# Monitor progress in logs
-tail -f /projectnb/herbdl/logs/image_install_*.log
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full procedure. In brief:
+
+```bash
+# One-time: build the status database (ingest multimedia.txt + import progress)
+qsub -N init_download_db -l h_rt=12:00:00 -pe omp 16 -P herbdl init_download_db.sh
+
+# Submit the download job (re-run any time to resume — it reads the work
+# queue from the database)
+qsub -N image_install_db -l h_rt=48:00:00 -pe omp 16 -P herbdl image_install_db.sh
+
+# Check progress at any time
+python status_report.py
 ```
 
 ### 2. Organize Downloaded Images
@@ -245,21 +384,23 @@ python link_check.py
 ## Directory Structures
 
 ### Hierarchical Image Storage
-Images are organized by GBIF ID prefix for efficient filesystem access:
+Images are organized by GBIF ID prefix for efficient filesystem access. Each
+image for a gbifID is saved with a zero-padded index suffix (`-00`, `-01`, ...):
 ```
 /projectnb/herbdl/data/GBIF-F25h/
-├── 000/
-│   ├── 000/
-│   │   ├── 000000.jpg
-│   │   ├── 000001.jpg
-│   ├── 001/
-│   │   ├── 000001000.jpg
-├── 001/
+├── 105/
+│   ├── 716/
+│   │   ├── 1057161997-00.jpg
+│   │   ├── 1057161997-01.jpg
+│   ├── 717/
+│   │   ├── 1057170001-00.jpg
+├── 106/
 │   ├── 000/
 │   ├── 001/
 ```
 
-This structure prevents issues with directories containing millions of files.
+`prefix1` is the first 3 digits of the gbifID, `prefix2` digits 4–6. This
+structure prevents issues with directories containing millions of files.
 
 ## Dependencies
 
@@ -278,5 +419,6 @@ This structure prevents issues with directories containing millions of files.
 
 - All scripts are designed for use on Boston University's Shared Computing Cluster (SCC)
 - Many scripts use parallel processing for performance
-- Checkpoint files enable resumable operations after interruptions
+- The `download_status.db` SQLite database enables resumable downloads and queryable error tracking; re-running the job simply continues the work queue
+- `analyze_image_progress.py` and the `processed_ids.txt` / `failed_ids.txt` files are superseded by the database (`status_report.py`); kept only for historical reference
 - Always verify paths before running scripts to avoid data loss
