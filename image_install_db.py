@@ -71,11 +71,13 @@ MIN_IMAGE_MB = 0.01          # files smaller than this are treated as invalid
 
 HOST_COOLDOWN_DEFAULT = 30 * 60
 HOST_COOLDOWN_TIMEOUT = 60 * 60
-HOST_ERROR_THRESHOLD = 500   # circuit breaker: skip a host after this many errors
-# A host that trips the circuit breaker is also persistently quarantined, so its
-# gbifIDs are pushed to the back of the work queue on later runs and working
-# sources download first (see download_db.get_work_gbif_ids). Shared with the
-# migration backfill in download_db.py so the two cannot drift apart.
+HOST_ERROR_THRESHOLD = 500   # circuit breaker: min errors before rate is judged
+# 500 is the minimum-sample floor, not an automatic skip: past it, both the
+# in-memory breaker (is_host_circuit_broken) and the persistent quarantine
+# (download_db.quarantine_if_unhealthy) judge a host by its failure RATE, so a
+# big-but-healthy source is spared and a released host is NOT re-skipped just for
+# carrying its old ~500 error_count. The two paths share this floor -- and the
+# QUARANTINE_FAILURE_RATE below -- so they cannot drift apart; keep the assert.
 QUARANTINE_THRESHOLD = ddb.QUARANTINE_ERROR_THRESHOLD
 assert QUARANTINE_THRESHOLD == HOST_ERROR_THRESHOLD
 
@@ -87,6 +89,7 @@ RAW_EXTS = (".dng", ".nef", ".cr2", ".cr3", ".arw", ".raf", ".orf", ".rw2",
 
 host_block_until = {}
 host_error_counts = {}
+host_success_counts = {}   # per-host succeeded downloads, for the failure-rate breaker
 host_lock = threading.Lock()
 circuit_breaker_lock = threading.Lock()
 counter_lock = threading.Lock()
@@ -169,9 +172,23 @@ def is_host_blocked(url):
 
 
 def is_host_circuit_broken(url):
+    """
+    Skip a host only when it is both past the minimum-sample floor AND failing
+    at a bad RATE. A host under HOST_ERROR_THRESHOLD errors is never broken (too
+    few samples to judge); past it, a big-but-healthy source (500 errors against
+    millions of successes) stays under QUARANTINE_FAILURE_RATE and is spared,
+    while a dead one (500 errors, no successes) trips.
+    """
     host = _host_from_url(url)
     with circuit_breaker_lock:
-        return host_error_counts.get(host, 0) >= HOST_ERROR_THRESHOLD
+        errors = host_error_counts.get(host, 0)
+        if errors < HOST_ERROR_THRESHOLD:
+            return False
+        successes = host_success_counts.get(host, 0)
+        total = errors + successes
+        if total == 0:
+            return False
+        return errors / total > ddb.QUARANTINE_FAILURE_RATE
 
 
 def increment_host_errors(url, is_rate_limit=False):
@@ -654,6 +671,14 @@ def process_id(db, gbif_id, total_to_install):
             file_size=result.get("file_size"))
 
         if result["outcome"] == "success":
+            # Feed the failure-rate circuit breaker: every real download success
+            # counts once here (both JPEG and kept-raw outcomes flow through this
+            # branch). host may be None if the successful URL had no netloc.
+            success_host = result.get("host")
+            if success_host:
+                with circuit_breaker_lock:
+                    host_success_counts[success_host] = (
+                        host_success_counts.get(success_host, 0) + 1)
             with counter_lock:
                 n_installed += 1
                 current = n_installed
@@ -706,11 +731,15 @@ def main():
     global quarantine_db
     quarantine_db = db
 
-    # Seed the in-memory circuit breaker from the last run's host stats.
-    saved_errors, saved_blocks = db.load_host_state()
+    # Seed the in-memory circuit breaker from the last run's host stats. Success
+    # counts are seeded too so the breaker can judge a host by failure RATE from
+    # the first request, instead of skipping a released host on its old errors.
+    saved_errors, saved_successes, saved_blocks = db.load_host_state()
     host_error_counts.update(saved_errors)
+    host_success_counts.update(saved_successes)
     host_block_until.update(saved_blocks)
     print(f"Loaded host state: {len(saved_errors)} hosts with errors, "
+          f"{len(saved_successes)} with successes, "
           f"{len(saved_blocks)} currently blocked.")
 
     work = db.get_work_gbif_ids()
