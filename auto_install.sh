@@ -18,8 +18,8 @@
 # ends (finished, crashed, h_rt kill, qdel) and only after it has fully
 # exited, so two rounds never have the database open at the same time. As a
 # backstop, a round also stops before touching the database if qstat shows
-# another image_inst* job (a manual round or a second chain) or a db_integ* job
-# (db_integrity_check.sh) running.
+# another image_inst* job (a manual round or a second chain), a db_integ* job
+# (db_integrity_check.sh) or an init_downl* job (init_download_db.sh) running.
 #
 #   start:                  qsub auto_install.sh
 #   behind a running job:   qsub -hold_jid <jobid> auto_install.sh
@@ -97,9 +97,10 @@ fi
 
 # --- refuse to run beside another job using the database --------------------
 # hold_jid keeps the chain's own rounds apart, but not a manual submission, a
-# second chain, or an integrity check. qstat truncates names to 10 characters:
-# image_install_db and image_install_auto both show as "image_inst", and
-# db_integrity (db_integrity_check.sh) as "db_integri". Running-type states
+# second chain, an integrity check or a database rebuild. qstat truncates names
+# to 10 characters: image_install_db and image_install_auto both show as
+# "image_inst", db_integrity (db_integrity_check.sh) as "db_integri", and
+# init_download_db (init_download_db.sh) as "init_downl". Running-type states
 # count: r; t (being dispatched -- two jobs started together must not both
 # pass); Rr/dr; and suspended s/S/T, which still hold the database open.
 # Pending states (qw, hqw, Eqw, Rq) contain none of those letters. If qstat
@@ -119,7 +120,7 @@ if [[ -z $qstat_ok ]]; then
 fi
 
 running=$(awk -v me="$JOB_ID" '
-    $3 ~ /^(image_inst|db_integ)/ && $5 ~ /[rtsST]/ && $1 != me { print $1, $3, $5 }
+    $3 ~ /^(image_inst|db_integ|init_downl)/ && $5 ~ /[rtsST]/ && $1 != me { print $1, $3, $5 }
 ' <<< "$qstat_out")
 if [[ -n $running ]]; then
     ids=$(awk '{ printf "%s%s", sep, $1; sep = "," }' <<< "$running")
