@@ -54,6 +54,31 @@ python image_install_db.py [--db PATH]
 qsub -N image_install_db -l h_rt=48:00:00 -pe omp 16 -P herbdl -m beas -M your_email@bu.edu image_install_db.sh
 ```
 
+#### `auto_install.sh`
+**Purpose**: Self-chaining version of `image_install_db.sh`, so download rounds keep going without a manual `qsub` every 48 hours. SGE hard-kills a job at `h_rt`, so the script does its bookkeeping at the **start** of each round. It posts the previous round's progress to Slack and writes `auto_state.txt`. Then it queues the next round with `qsub -hold_jid $JOB_ID` and runs `image_install_db.sh` unchanged. The hold releases however the job ends, including the `h_rt` kill, but only after it has fully exited, so two rounds never have the database open at once.
+
+The chain stops itself if the previous round lasted under an hour, which means a crash or an empty work queue. It also stops if a full round added no images. In both cases it posts to Slack and queues nothing. As a backstop against a manual submission or a second chain, a round also stops before touching the database if `qstat` shows another running `image_inst*` job. `qstat` truncates both `image_install_db` and `image_install_auto` to `image_inst`. SGE directives (job name `image_install_auto`, 48 h, 16 cores, mail on abort) are in the script, so submit it with no options. Logs go to `image_install_auto.o<jobid>` / `.e<jobid>`.
+
+**Start the chain** from the repo root. Check `qstat -u $USER` first. If no download job is running or queued:
+```bash
+rm -f STOP_AUTO auto_state.txt   # clear any previous chain's state
+qsub auto_install.sh
+```
+
+**Start it behind an already-running download job**, e.g. a manual `image_install_db.sh` round, so the two never use the database at once. The chain waits for that job to exit:
+```bash
+rm -f STOP_AUTO auto_state.txt
+qsub -hold_jid <jobid> auto_install.sh
+```
+
+**Stop the chain**:
+```bash
+touch STOP_AUTO
+```
+The current round keeps running to completion or `h_rt`. The next round, already queued, sees `STOP_AUTO`, posts to Slack, and exits without queuing another. To stop right away, `touch STOP_AUTO` and then `qdel` the running job (`r` in `qstat`) and the queued one (`hqw`).
+
+To restart after any stop, fix the cause and run the start commands above.
+
 #### `image_install_parallel.py` (original)
 **Purpose**: The original downloader, kept for reference and fallback — superseded by `image_install_db.py`. Downloads **one** image per gbifID (stops at the first URL that succeeds) and tracks progress in flat `processed_ids.txt` / `failed_ids.txt` files.
 

@@ -10,3 +10,7 @@ summary*.txt
 # ignore batch scheduler log files
 *.e[0-9]*
 *.o[0-9]*
+
+# auto_install.sh chain state and stop flag
+auto_state.txt
+STOP_AUTO
