@@ -18,7 +18,8 @@
 # ends (finished, crashed, h_rt kill, qdel) and only after it has fully
 # exited, so two rounds never have the database open at the same time. As a
 # backstop, a round also stops before touching the database if qstat shows
-# another image_inst* job running (a manual round or a second chain).
+# another image_inst* job (a manual round or a second chain) or a db_integ* job
+# (db_integrity_check.sh) running.
 #
 #   start:                  qsub auto_install.sh
 #   behind a running job:   qsub -hold_jid <jobid> auto_install.sh
@@ -94,14 +95,15 @@ if [[ -e $STOP_FILE ]]; then
     exit 0
 fi
 
-# --- refuse to run beside another download job ------------------------------
-# hold_jid keeps the chain's own rounds apart, but not a manual submission or a
-# second chain. qstat truncates names to 10 characters, so image_install_db and
-# image_install_auto both show as "image_inst". Running-type states count: r;
-# t (being dispatched -- two jobs started together must not both pass); Rr/dr;
-# and suspended s/S/T, which still hold the database open. Pending states (qw,
-# hqw, Eqw, Rq) contain none of those letters. If qstat keeps failing we can't
-# rule out a clash, so stop rather than risk it.
+# --- refuse to run beside another job using the database --------------------
+# hold_jid keeps the chain's own rounds apart, but not a manual submission, a
+# second chain, or an integrity check. qstat truncates names to 10 characters:
+# image_install_db and image_install_auto both show as "image_inst", and
+# db_integrity (db_integrity_check.sh) as "db_integri". Running-type states
+# count: r; t (being dispatched -- two jobs started together must not both
+# pass); Rr/dr; and suspended s/S/T, which still hold the database open.
+# Pending states (qw, hqw, Eqw, Rq) contain none of those letters. If qstat
+# keeps failing we can't rule out a clash, so stop rather than risk it.
 
 qstat_ok=""
 for attempt in 1 2 3; do
@@ -112,15 +114,17 @@ for attempt in 1 2 3; do
     (( attempt < 3 )) && sleep 60
 done
 if [[ -z $qstat_ok ]]; then
-    notify "STOPPED: qstat failed 3 times (${qstat_out//$'\n'/ }), so another download job can't be ruled out. Job $JOB_ID did nothing (no count, nothing queued, no download). Resubmit with: qsub auto_install.sh"
+    notify "STOPPED: qstat failed 3 times (${qstat_out//$'\n'/ }), so another job using the database can't be ruled out. Job $JOB_ID did nothing (no count, nothing queued, no download). Resubmit with: qsub auto_install.sh"
     exit 2
 fi
 
-running=$(awk -v me="$JOB_ID" '$3 ~ /^image_inst/ && $5 ~ /[rtsST]/ && $1 != me { print $1, $5 }' <<< "$qstat_out")
+running=$(awk -v me="$JOB_ID" '
+    $3 ~ /^(image_inst|db_integ)/ && $5 ~ /[rtsST]/ && $1 != me { print $1, $3, $5 }
+' <<< "$qstat_out")
 if [[ -n $running ]]; then
     ids=$(awk '{ printf "%s%s", sep, $1; sep = "," }' <<< "$running")
-    listing=$(awk '{ printf "%s%s (%s)", sep, $1, $2; sep = ", " }' <<< "$running")
-    notify "STOPPED: another download job is already running: $listing. Job $JOB_ID did nothing (no count, nothing queued, no download), so the database is never open in two jobs at once. If that's the auto chain, it carries on by itself; if it's a manual round, queue the chain behind it: qsub -hold_jid $ids auto_install.sh"
+    listing=$(awk '{ printf "%s%s %s (%s)", sep, $1, $2, $3; sep = ", " }' <<< "$running")
+    notify "STOPPED: another job using the database is already running: $listing. Job $JOB_ID did nothing (no count, nothing queued, no download), so the database is never open in two jobs at once. If that's the auto chain, it carries on by itself; otherwise queue the chain behind it: qsub -hold_jid $ids auto_install.sh"
     exit 2
 fi
 

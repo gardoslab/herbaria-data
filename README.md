@@ -57,7 +57,7 @@ qsub -N image_install_db -l h_rt=48:00:00 -pe omp 16 -P herbdl -m beas -M your_e
 #### `auto_install.sh`
 **Purpose**: Self-chaining version of `image_install_db.sh`, so download rounds keep going without a manual `qsub` every 48 hours. SGE hard-kills a job at `h_rt`, so the script does its bookkeeping at the **start** of each round. It posts the previous round's progress to Slack and writes `auto_state.txt`. Then it queues the next round with `qsub -hold_jid $JOB_ID` and runs `image_install_db.sh` unchanged. The hold releases however the job ends, including the `h_rt` kill, but only after it has fully exited, so two rounds never have the database open at once.
 
-The chain stops itself if the previous round lasted under an hour, which means a crash or an empty work queue. It also stops if a full round added no images. In both cases it posts to Slack and queues nothing. As a backstop against a manual submission or a second chain, a round also stops before touching the database if `qstat` shows another running `image_inst*` job. `qstat` truncates both `image_install_db` and `image_install_auto` to `image_inst`. SGE directives (job name `image_install_auto`, 48 h, 16 cores, mail on abort) are in the script, so submit it with no options. Logs go to `image_install_auto.o<jobid>` / `.e<jobid>`.
+The chain stops itself if the previous round lasted under an hour, which means a crash or an empty work queue. It also stops if a full round added no images. In both cases it posts to Slack and queues nothing. As a backstop, a round also stops before touching the database if `qstat` shows another `image_inst*` job running (a manual round or a second chain) or a `db_integ*` job (an integrity check). `qstat` truncates names to 10 characters: `image_install_db` and `image_install_auto` both show as `image_inst`, and `db_integrity` as `db_integri`. SGE directives (job name `image_install_auto`, 48 h, 16 cores, mail on abort) are in the script, so submit it with no options. Logs go to `image_install_auto.o<jobid>` / `.e<jobid>`.
 
 **Start the chain** from the repo root. Check `qstat -u $USER` first. If no download job is running or queued:
 ```bash
@@ -170,19 +170,28 @@ sqlite3 -readonly /projectnb/herbdl/data/GBIF-F25h/download_status.db "SELECT CO
 
 **Usage**:
 ```bash
-# 1. pause the downloader (find its job-ID with `qstat -u $USER`)
-qdel <image_install_db_jobid>
+# 1. stop the auto chain (auto_install.sh) from starting another round, then
+#    delete the round already waiting behind the running one, if any (state
+#    hqw in `qstat -u $USER`). Do this before step 2: deleting the running
+#    job first would release the waiting round.
+touch STOP_AUTO
+qdel <waiting_hqw_jobid>
 
-# 2. give SQLite a few seconds to checkpoint the WAL
+# 2. pause the downloader: the running image_install_auto or image_install_db
+#    job (state r in `qstat -u $USER`)
+qdel <running_jobid>
+
+# 3. give SQLite a few seconds to checkpoint the WAL
 sleep 30
 
-# 3. submit the integrity check
+# 4. submit the integrity check. While it runs (db_integri in qstat),
+#    auto_install.sh also refuses to start a round.
 qsub -N db_integrity -l h_rt=4:00:00 -pe omp 4 -P herbdl -j y \
      -o db_integrity.out db_integrity_check.sh
 
-# 4. when db_integrity.out shows 'ok', restart the downloader
-qsub -N image_install_db -l h_rt=48:00:00 -pe omp 16 -P herbdl \
-     -m beas -M your_email@bu.edu image_install_db.sh
+# 5. when db_integrity.out shows 'ok', restart the auto chain
+rm -f STOP_AUTO auto_state.txt
+qsub auto_install.sh
 ```
 
 On a clean DB the check prints `ok` (takes ~10–20 minutes on a ~20 GB DB), followed by current row counts for `images`, `gbif_ids`, `hosts`, and a `gbif_ids`-by-status breakdown. Any other output indicates real corruption — capture it from `db_integrity.out`.
