@@ -41,13 +41,14 @@ import logging
 import threading
 import datetime as dt
 from argparse import ArgumentParser
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import urllib3
 import requests as req
 from requests.exceptions import ConnectTimeout, ReadTimeout, Timeout, ConnectionError
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import NameResolutionError, NewConnectionError, ProtocolError
 from urllib3.util.retry import Retry
 from PIL import UnidentifiedImageError
 
@@ -81,6 +82,21 @@ HOST_ERROR_THRESHOLD = 500   # circuit breaker: min errors before rate is judged
 QUARANTINE_THRESHOLD = ddb.QUARANTINE_ERROR_THRESHOLD
 assert QUARANTINE_THRESHOLD == HOST_ERROR_THRESHOLD
 
+# Past the threshold, a host is judged again every this many further errors
+# (600, 700, ...), not only once at 500. Otherwise a host that crossed 500 while
+# healthy -- or was released from quarantine still carrying its old >500
+# error_count -- is never re-checked if it goes bad. The spacing keeps the
+# quarantine check (a DB read, plus a write when it quarantines) rare.
+HOST_ERROR_RECHECK_EVERY = 100
+
+# Request timeouts, passed to requests as a (connect, read) tuple. A host that
+# has not accepted the connection within CONNECT_TIMEOUT is treated as
+# unreachable; the read timeouts (longest wait for data once connected) stay
+# long so a slow but working host is not cut off.
+CONNECT_TIMEOUT = 20
+IMAGE_READ_TIMEOUT = 180
+MANIFEST_READ_TIMEOUT = 120
+
 # Extensions under which an undecodable-but-real image is kept for later.
 RAW_EXTS = (".dng", ".nef", ".cr2", ".cr3", ".arw", ".raf", ".orf", ".rw2",
             ".tif", ".raw")
@@ -109,6 +125,14 @@ user_agents = [
 session = req.Session()
 retry_strategy = Retry(
     total=2,
+    # Never retry a failed connection. Within one CONNECT_TIMEOUT the kernel has
+    # already re-sent the SYN several times, so a host that stayed silent is
+    # down, not flaky -- and each retry cost another full timeout (it was 3 x
+    # 180 s + backoff, ~9 min per URL). A dead host now costs one
+    # CONNECT_TIMEOUT per URL, ~40 s for an http:// URL including its https://
+    # fallback (per address: urllib3 tries each of a host's IPs in turn).
+    # Read errors and 5xx responses are still retried under `total`.
+    connect=0,
     backoff_factor=1,
     status_forcelist=[500, 502, 503, 504],
     allowed_methods=["HEAD", "GET", "OPTIONS"],
@@ -171,6 +195,18 @@ def is_host_blocked(url):
     return False
 
 
+def _breaker_trips(errors, successes):
+    """
+    The circuit-breaker rule, shared by is_host_circuit_broken and the CIRCUIT
+    BREAKER log: past the HOST_ERROR_THRESHOLD sample floor AND failing at a
+    rate over QUARANTINE_FAILURE_RATE.
+    """
+    if errors < HOST_ERROR_THRESHOLD:
+        return False
+    total = errors + successes
+    return total > 0 and errors / total > ddb.QUARANTINE_FAILURE_RATE
+
+
 def is_host_circuit_broken(url):
     """
     Skip a host only when it is both past the minimum-sample floor AND failing
@@ -181,14 +217,8 @@ def is_host_circuit_broken(url):
     """
     host = _host_from_url(url)
     with circuit_breaker_lock:
-        errors = host_error_counts.get(host, 0)
-        if errors < HOST_ERROR_THRESHOLD:
-            return False
-        successes = host_success_counts.get(host, 0)
-        total = errors + successes
-        if total == 0:
-            return False
-        return errors / total > ddb.QUARANTINE_FAILURE_RATE
+        return _breaker_trips(host_error_counts.get(host, 0),
+                              host_success_counts.get(host, 0))
 
 
 def increment_host_errors(url, is_rate_limit=False):
@@ -199,20 +229,28 @@ def increment_host_errors(url, is_rate_limit=False):
     with circuit_breaker_lock:
         host_error_counts[host] = host_error_counts.get(host, 0) + 1
         count = host_error_counts[host]
-        if count == HOST_ERROR_THRESHOLD:
-            logger.error(f"CIRCUIT BREAKER: host '{host}' reached "
-                         f"{HOST_ERROR_THRESHOLD} errors; skipping it from now on.")
+        # Judge the host at the threshold and every HOST_ERROR_RECHECK_EVERY
+        # errors after it. Counts rise by one under this lock, so exactly one
+        # thread sees each checkpoint -- including for a host seeded from the DB
+        # already past the threshold (seeded at 501 -> first re-check at 600).
+        past = count - HOST_ERROR_THRESHOLD
+        checkpoint = past >= 0 and past % HOST_ERROR_RECHECK_EVERY == 0
+        successes = host_success_counts.get(host, 0)
+        if checkpoint and _breaker_trips(count, successes):
+            logger.error(f"CIRCUIT BREAKER: host '{host}' at {count} errors vs "
+                         f"{successes} successes (failure rate "
+                         f"{count / (count + successes):.2f}); skipping it.")
 
-    # Persistently quarantine a host once it crosses the threshold, so its
-    # gbifIDs are pushed to the back of the work queue on later runs. Marked
-    # exactly once (only the thread that reaches the threshold sees count ==
-    # QUARANTINE_THRESHOLD), and done outside circuit_breaker_lock so the DB
-    # write does not block other workers' error accounting.
+    # Persistently quarantine a host at the same checkpoints, so its gbifIDs are
+    # pushed to the back of the work queue on later runs. Done outside
+    # circuit_breaker_lock so the DB work does not block other workers' error
+    # accounting -- and quarantine_if_unhealthy takes the DB lock itself, so it
+    # must not be called with that held either (downloads never hold it).
     #
     # quarantine_if_unhealthy checks the failure RATE, not just the raw count, so
     # a big-but-healthy source (nmnh) is spared while a dead one (oxalis) is
     # caught. Only log QUARANTINED when it actually quarantined the host.
-    if count == QUARANTINE_THRESHOLD and quarantine_db is not None:
+    if checkpoint and quarantine_db is not None:
         try:
             if quarantine_db.quarantine_if_unhealthy(host, error_count=count):
                 logger.error(f"QUARANTINED host '{host}' after {count} errors; its "
@@ -242,6 +280,108 @@ def block_host(url, retry_after=None, timeout_issue=False):
     logger.warning(f"Blocking host '{host}' due to {reason} for ~{int(seconds)}s.")
 
 
+# ---- http:// -> https:// fallback --------------------------------------------
+#
+# Some hosts have closed port 80 but serve the same paths over HTTPS (e.g.
+# sweetgum.nybg.org, ipt.nature.ca), while their GBIF records still give
+# http:// URLs. So an http:// URL that fails to connect is retried once as
+# https://.
+
+# Hosts whose https:// fallback has worked this run. Their later http:// URLs go
+# straight to https:// -- otherwise every image on such a host would first wait
+# out CONNECT_TIMEOUT on the closed port. In memory only, so each run
+# re-discovers them at the cost of one timeout per host. Guarded by host_lock.
+https_upgrade_hosts = set()
+
+
+def https_fallback_url(url):
+    """
+    The https:// twin of an http:// URL, or None when there is none to try: the
+    URL is not http://, or names an explicit port (https:// on that same port
+    would be a different service).
+    """
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "http":
+        return None
+    try:
+        if parts.port is not None:
+            return None
+    except ValueError:      # malformed port; the request itself will fail
+        return None
+    return urlunsplit(parts._replace(scheme="https"))
+
+
+def _failed_to_connect(exc):
+    """
+    True if a request exception means the server never answered: a connect
+    timeout, a refused or unreachable connection, or the connection dropped
+    before any reply. False for a DNS failure (https:// looks up the same name),
+    a read timeout (the host is up, just slow), and errors after a response
+    began, e.g. a manifest body stalling mid-download, which requests also
+    raises as ConnectionError.
+    """
+    if isinstance(exc, ConnectTimeout):
+        return True
+    if not isinstance(exc, ConnectionError):
+        return False
+    reason = exc.args[0] if exc.args else None
+    reason = getattr(reason, "reason", reason)   # unwrap urllib3's MaxRetryError
+    if isinstance(reason, NameResolutionError):
+        return False
+    return isinstance(reason, (NewConnectionError, ProtocolError))
+
+
+def get_with_https_fallback(url, **kwargs):
+    """
+    session.get(url, **kwargs), retrying an http:// URL once as https:// if it
+    fails to connect. Returns (response, via_https).
+
+    Whatever comes back is the caller's to classify, so the call is counted as
+    one attempt however many requests it made. If the https:// retry fails too,
+    one exception carries both errors: a ConnectTimeout if either attempt timed
+    out (so the caller still applies the timeout cooldown -- each cost
+    CONNECT_TIMEOUT), else the original http:// error's type.
+    """
+    https_url = https_fallback_url(url)
+    if https_url is None:
+        return session.get(url, **kwargs), False
+    with host_lock:
+        upgraded = _host_from_url(url) in https_upgrade_hosts
+    if upgraded:
+        return session.get(https_url, **kwargs), True
+
+    try:
+        return session.get(url, **kwargs), False
+    except ConnectionError as e:          # ConnectTimeout is a ConnectionError
+        if not _failed_to_connect(e):
+            raise
+        http_error = e
+
+    try:
+        return session.get(https_url, **kwargs), True
+    except ConnectionError as e:
+        timed_out = isinstance(http_error, ConnectTimeout) or isinstance(e, ConnectTimeout)
+        error_cls = ConnectTimeout if timed_out else type(http_error)
+        raise error_cls(f"{http_error} [https:// fallback also failed: {e}]",
+                        request=http_error.request) from e
+
+
+def _note_https_fallback_worked(url):
+    """
+    Record that an http:// URL's https:// fallback gave a good result, so the
+    host's later http:// URLs go straight to https:// this run. Logged once per
+    host rather than per image, to keep the log small.
+    """
+    host = _host_from_url(url)
+    with host_lock:
+        if host in https_upgrade_hosts:
+            return
+        https_upgrade_hosts.add(host)
+    logger.warning(f"HTTPS fallback: '{host}' does not accept http:// connections "
+                   f"but https:// works; fetching its http:// URLs over https:// "
+                   f"for the rest of this run.")
+
+
 # ---- IIIF manifests ----------------------------------------------------------
 
 def is_manifest_url(url):
@@ -262,11 +402,11 @@ def extract_image_from_iiif_manifest(manifest_url, gbif_id):
         # Throttle these requests a bit more than image downloads to
         # avoid overwhelming the server and getting connections dropped.
         time.sleep(random.uniform(0.5, 1.5))
-        response = session.get(
+        response, via_https = get_with_https_fallback(
             manifest_url,
             headers={"User-Agent": random.choice(user_agents),
                      "Accept": "application/json"},
-            timeout=120,
+            timeout=(CONNECT_TIMEOUT, MANIFEST_READ_TIMEOUT),
         )
         if response.status_code != 200:
             logger.warning(f"IIIF manifest {gbif_id}: HTTP {response.status_code}")
@@ -305,6 +445,8 @@ def extract_image_from_iiif_manifest(manifest_url, gbif_id):
         if not image_urls:
             increment_host_errors(manifest_url)
             return [], ddb.ERR_MANIFEST
+        if via_https:
+            _note_https_fallback_worked(manifest_url)
         return image_urls, None
 
     except (ConnectTimeout, ReadTimeout, Timeout) as e:
@@ -402,17 +544,23 @@ def download_one_url(gbif_id, image_url, tmp_path):
 
     Detects HTML/text responses -- including ones disguised with an image
     Content-Type -- and captures the page text into error_detail.
+
+    An http:// URL that fails to connect is retried once as https:// (see
+    get_with_https_fallback); either way the outcome is counted once.
     """
     host = _host_from_url(image_url)
+    via_https = False   # set once a response is in; fail() reads the final value
 
     def fail(error_type, detail, http_status=None, content_type=None):
+        if via_https:
+            detail = f"{detail} [via https:// fallback]"
         return {"ok": False, "host": host, "http_status": http_status,
                 "content_type": content_type, "size": None,
                 "error_type": error_type, "error_detail": detail}
 
     try:
         time.sleep(random.uniform(0.2, 0.8))
-        with session.get(
+        resp, via_https = get_with_https_fallback(
             image_url,
             stream=True,
             verify=False,
@@ -421,8 +569,9 @@ def download_one_url(gbif_id, image_url, tmp_path):
                 "Connection": "keep-alive",
                 "Referer": "https://scc-ondemand1.bu.edu/",
             },
-            timeout=180,
-        ) as resp:
+            timeout=(CONNECT_TIMEOUT, IMAGE_READ_TIMEOUT),
+        )
+        with resp:
             status = resp.status_code
 
             if status == 429:
@@ -484,10 +633,22 @@ def download_one_url(gbif_id, image_url, tmp_path):
                 return fail(ddb.ERR_TRUNCATED, f"only {written} bytes",
                             status, ctype)
 
+            if via_https:
+                _note_https_fallback_worked(image_url)
             return {"ok": True, "host": host, "http_status": status,
                     "content_type": ctype, "size": written}
 
-    except (ConnectTimeout, ReadTimeout, Timeout) as e:
+    except ConnectTimeout as e:
+        # No connection within CONNECT_TIMEOUT (for an http:// URL, over https://
+        # either). Count it, so a host that only ever times out still reaches
+        # the circuit breaker / quarantine, and cool the host down.
+        _rm(tmp_path)
+        increment_host_errors(image_url)
+        block_host(image_url, timeout_issue=True)
+        return fail(ddb.ERR_TIMEOUT, str(e))
+    except Timeout as e:
+        # Read timeout: the host is up but slow. Cool it down, but do not count
+        # it -- a slow but working source is not a broken one.
         _rm(tmp_path)
         block_host(image_url, timeout_issue=True)
         return fail(ddb.ERR_TIMEOUT, str(e))

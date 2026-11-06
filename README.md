@@ -40,7 +40,9 @@ python image_install_db.py [--db PATH]
 **Advanced Features**:
 - Host cooldown on rate limiting (429 errors): 30 minutes default
 - Host cooldown on timeouts: 60 minutes
-- Circuit breaker: skips hosts after 500+ errors; state persists across runs in the `hosts` table
+- Timeouts: 20 s to connect, then 180 s read (120 s for IIIF manifests). Failed connections are not retried, so a dead host costs ~20 s per URL (~40 s for an `http://` URL, counting its `https://` fallback)
+- `http://` URLs that fail to connect are retried once over `https://` (some hosts, e.g. sweetgum.nybg.org, have closed port 80); once that works for a host, its `http://` URLs go straight to `https://` for the rest of the run
+- Circuit breaker: skips a host once it has 500+ errors *and* a failure rate over `QUARANTINE_FAILURE_RATE` (download_db.py). Connect timeouts count as errors; read timeouts on image downloads, and 429s, only cool the host down. A host is re-judged, and its quarantine re-checked, every 100 errors past 500. State persists across runs in the `hosts` table
 - Failures are classified (404, 401, timeout, rate-limited, dropped connection, …); only transient failures are retried, capped at 4 attempts
 - Retry strategy with backoff for 500-level errors
 
