@@ -937,8 +937,8 @@ def main():
     finally:
         db.save_host_state(host_error_counts, host_block_until)
         counts = db.gbif_status_counts()
-        broken = sum(1 for c in host_error_counts.values()
-                     if c >= HOST_ERROR_THRESHOLD)
+        broken = sum(1 for host, errors in host_error_counts.items()
+                     if _breaker_trips(errors, host_success_counts.get(host, 0)))
         logger.warning(f"Run finished. Images installed this run: {n_installed}. "
                        f"gbifID status: {counts}. Circuit-broken hosts: {broken}.")
         for host, count in sorted(host_error_counts.items(),
